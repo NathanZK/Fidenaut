@@ -740,6 +740,23 @@ def _current_branch(root, config):
     return completed["stdout_text"].strip() or None
 
 
+def _is_workflow_owned_path(root, config, path):
+    """Ignore the configured workflow state directory while keeping source dirtiness checks strict."""
+    if not path:
+        return False
+    run_root = _artifact_root(root, config)
+    candidate = pathlib.Path(path)
+    if not candidate.is_absolute():
+        candidate = (root / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    try:
+        candidate.relative_to(run_root)
+    except ValueError:
+        return False
+    return True
+
+
 def _git_status(root, config):
     completed = _run_checked(
         _git_command(config, "status", "--porcelain"),
@@ -748,7 +765,14 @@ def _git_status(root, config):
         "git-status-failed",
         "unable to inspect working tree",
     )
-    return [line for line in completed["stdout_text"].splitlines() if line]
+    rows = []
+    for line in completed["stdout_text"].splitlines():
+        if not line:
+            continue
+        path = _status_path(line)
+        if not _is_workflow_owned_path(root, config, path):
+            rows.append(line)
+    return rows
 
 
 def _git_status_all(root, config):
@@ -759,7 +783,14 @@ def _git_status_all(root, config):
         "git-status-failed",
         "unable to inspect working tree",
     )
-    return [line for line in completed["stdout_text"].splitlines() if line]
+    rows = []
+    for line in completed["stdout_text"].splitlines():
+        if not line:
+            continue
+        path = _status_path(line)
+        if not _is_workflow_owned_path(root, config, path):
+            rows.append(line)
+    return rows
 
 
 def _status_path(line):

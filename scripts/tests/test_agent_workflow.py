@@ -2495,6 +2495,19 @@ class AgentWorkflowTest(unittest.TestCase):
         self.assertEqual("invalid-git-ancestry", payload["error"]["code"])
         self.assertEqual(before, self.state())
 
+    def test_clean_worktree_excludes_workflow_run_root_but_not_unrelated_changes(self):
+        """Workflow state can live under .agent-workflow without masking unrelated dirt."""
+        code, _, _ = self.run_cli("init", str(ISSUE))
+        self.assertEqual(0, code)
+        config = self.repository_workflow_config()
+        self.assertEqual([], workflow._git_status(self.root, config))
+        self.assertEqual([], workflow._git_status_all(self.root, config))
+
+        (self.root / "unrelated.txt").write_text("dirty\n", encoding="utf-8")
+        with self.assertRaises(workflow.WorkflowError) as ctx:
+            workflow._require_clean_tree(self.root, config, "workflow-check")
+        self.assertEqual("git-worktree-dirty", ctx.exception.code)
+
     def test_reanchor_target_rejects_dirty_worktree(self):
         """Re-anchoring never inspects or changes a dirty working tree."""
         self.bootstrap_to_planning_for_reanchor()
