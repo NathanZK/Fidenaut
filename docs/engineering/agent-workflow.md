@@ -92,6 +92,31 @@ through the applicable governed revision path. It cannot silently inherit an
 approval for earlier bytes, and names such as `plan-final.md` or
 `implementation-v2.md` are not a provenance mechanism.
 
+## External provider runtime boundary
+
+When Fidenaut is consumed as a pinned external provider runtime, the consumer
+repository remains authoritative for its source tree and workflow
+configuration. The provider overlay is represented explicitly by an optional
+workflow-local manifest at `.agent-workflow/provider-runtime-manifest.json`.
+There is no alternate command sequence or bypass flag: normal commands discover
+this manifest automatically.
+
+The manifest format is `fidenaut-provider-runtime-manifest-v1`. It records the
+provider repository/revision and an exact path, mode, and SHA-256 identity for
+each provider-owned runtime file. At `init`, the workflow stores this provider
+runtime identity in run state. Every later command revalidates that the current
+manifest and every provider file still match the initialized identity before
+using the run state.
+
+Only after that integrity check succeeds do clean-worktree and uncommitted
+candidate calculations exclude those exact provider-owned file paths. Consumer
+changes remain visible to clean-tree, scope, candidate, evidence, approval,
+validation, and publication checks. Provider file tampering, provider manifest
+revision drift, missing provider files, or hash/mode mismatches fail closed
+instead of becoming ignored dirt. This boundary is intentionally narrower than
+a path exclusion list: provider files are immutable inputs to execution, not an
+area where candidate changes may be hidden.
+
 ## Gate sequence
 
 1. `init`

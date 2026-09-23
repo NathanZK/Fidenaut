@@ -262,31 +262,9 @@ class AgentWorkflowTest(unittest.TestCase):
         return path
 
     def git_candidate_diff(self, test_commit):
-        tracked = self.git("diff", "--binary", test_commit, "--").stdout
-        status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=all"],
-            cwd=self.root,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        ).stdout
-        additions = []
-        for line in status.splitlines():
-            if not line.startswith("?? "):
-                continue
-            path = line[3:]
-            completed = subprocess.run(
-                ["git", "diff", "--binary", "--no-index", "--", "/dev/null", path],
-                cwd=self.root,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            self.assertIn(completed.returncode, (0, 1), completed.stderr)
-            additions.append(completed.stdout)
-        return tracked + "".join(additions)
+        return workflow._git_candidate_diff(
+            self.root, workflow._load_config(self.root), test_commit
+        )
 
     def write_evidence(
         self,
@@ -332,6 +310,85 @@ class AgentWorkflowTest(unittest.TestCase):
         path = self.root / "artifacts-src" / name
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         return "artifacts-src/" + name
+
+    def write_provider_runtime_manifest(
+        self,
+        revision="c100b5b1336e6f9c0c914641a940d435d7df3dff",
+        provider_files=None,
+    ):
+        if provider_files is None:
+            provider_files = {
+                "scripts/agent_workflow.py": "provider workflow runtime\n",
+                ".github/agents/chess-echo-planner.md": "provider planner contract\n",
+            }
+        entries = []
+        for relative_path, content in provider_files.items():
+            path = self.root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            mode = "100755" if os.access(path, os.X_OK) else "100644"
+            entries.append(
+                {
+                    "path": relative_path,
+                    "mode": mode,
+                    "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                }
+            )
+        manifest = {
+            "format": workflow.PROVIDER_RUNTIME_MANIFEST_FORMAT,
+            "provider": {
+                "repository": "NathanZK/Fidenaut",
+                "revision": revision,
+            },
+            "files": sorted(entries, key=lambda item: item["path"]),
+        }
+        manifest_path = self.root / ".agent-workflow" / workflow.PROVIDER_RUNTIME_MANIFEST
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        return manifest_path
+
+    def bootstrap_not_applicable_plan(self):
+        self.write_artifact("plan.md", "Plan scope: production-only boundary change\n")
+        self.write_artifact("plan-review.md", "Plan review ready for self-attested approval\n")
+        self.write_artifact("test-report.md", "Tests not applicable per approved plan\n")
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        self.assertEqual(
+            0,
+            self.run_cli(
+                "submit-plan",
+                str(ISSUE),
+                "--artifact",
+                "artifacts-src/plan.md",
+                "--agent",
+                "chess-echo-planner",
+                "--scope",
+                "src/Example.kt",
+            )[0],
+        )
+        self.assertEqual(
+            0,
+            self.run_cli(
+                "review-plan",
+                str(ISSUE),
+                "--status",
+                workflow.READY,
+                "--artifact",
+                "artifacts-src/plan-review.md",
+                "--reviewer",
+                "chess-echo-reviewer",
+            )[0],
+        )
+        self.assertEqual(
+            0,
+            self.run_cli(
+                "approve-plan",
+                str(ISSUE),
+                "--by",
+                "owner",
+                "--confirm",
+                "plan_approved",
+            )[0],
+        )
 
     def state(self):
         path = (
@@ -2507,6 +2564,110 @@ class AgentWorkflowTest(unittest.TestCase):
         with self.assertRaises(workflow.WorkflowError) as ctx:
             workflow._require_clean_tree(self.root, config, "workflow-check")
         self.assertEqual("git-worktree-dirty", ctx.exception.code)
+
+    def test_submit_tests_not_applicable_accepts_manifest_verified_provider_runtime(self):
+        """A pinned provider overlay is immutable input, not consumer worktree dirt."""
+        self.write_provider_runtime_manifest()
+        self.bootstrap_not_applicable_plan()
+
+        code, payload, _ = self.run_cli(
+            "submit-tests",
+            str(ISSUE),
+            "--artifact",
+            "artifacts-src/test-report.md",
+            "--agent",
+            "chess-echo-test-implementer",
+            "--not-applicable",
+            "--reason",
+            "Approved plan classified the provider-boundary regression as not requiring tests first.",
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("TEST_REVIEW", payload["status"])
+        self.assertEqual(
+            "c100b5b1336e6f9c0c914641a940d435d7df3dff",
+            self.state()["provider_runtime"]["provider"]["revision"],
+        )
+
+    def test_provider_runtime_boundary_still_detects_consumer_dirty_worktree(self):
+        """Provider inputs are filtered only after verification; consumer dirt remains visible."""
+        self.write_provider_runtime_manifest()
+        self.bootstrap_not_applicable_plan()
+        (self.root / "consumer-dirty.txt").write_text("consumer change\n", encoding="utf-8")
+
+        code, payload, _ = self.run_cli(
+            "submit-tests",
+            str(ISSUE),
+            "--artifact",
+            "artifacts-src/test-report.md",
+            "--agent",
+            "chess-echo-test-implementer",
+            "--not-applicable",
+            "--reason",
+            "Approved plan classified tests as not applicable.",
+        )
+
+        self.assertEqual(1, code)
+        self.assertEqual("git-worktree-dirty", payload["error"]["code"])
+
+    def test_provider_runtime_boundary_fails_closed_on_provider_tampering(self):
+        """Provider paths are not an exclusion zone for unverified changes."""
+        self.write_provider_runtime_manifest()
+        self.bootstrap_not_applicable_plan()
+        (self.root / "scripts" / "agent_workflow.py").write_text(
+            "tampered provider runtime\n", encoding="utf-8"
+        )
+
+        code, payload, _ = self.run_cli(
+            "submit-tests",
+            str(ISSUE),
+            "--artifact",
+            "artifacts-src/test-report.md",
+            "--agent",
+            "chess-echo-test-implementer",
+            "--not-applicable",
+            "--reason",
+            "Approved plan classified tests as not applicable.",
+        )
+
+        self.assertEqual(1, code)
+        self.assertEqual("provider-runtime-integrity-mismatch", payload["error"]["code"])
+
+    def test_provider_runtime_identity_is_bound_after_init(self):
+        """Changing the manifest identity after init cannot silently rebind a run."""
+        manifest_path = self.write_provider_runtime_manifest()
+        self.bootstrap_not_applicable_plan()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["provider"]["revision"] = "d" * 40
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        code, payload, _ = self.run_cli("status", str(ISSUE))
+
+        self.assertEqual(1, code)
+        self.assertEqual("provider-runtime-identity-mismatch", payload["error"]["code"])
+
+    def test_provider_runtime_boundary_preserves_candidate_scope_checks(self):
+        """Verified provider files are excluded from candidate identity, but consumer scope is not."""
+        self.write_provider_runtime_manifest()
+        self.bootstrap_to_implementation(implementation_paths=["src/Example.kt"])
+        (self.root / "src" / "Example.kt").parent.mkdir(parents=True, exist_ok=True)
+        (self.root / "src" / "Example.kt").write_text("implementation\n", encoding="utf-8")
+        (self.root / "out-of-scope.txt").write_text("consumer escape\n", encoding="utf-8")
+        evidence_path = self.write_evidence()
+
+        code, payload, _ = self.run_cli(
+            "submit-implementation",
+            str(ISSUE),
+            "--artifact",
+            "artifacts-src/implementation-report.md",
+            "--agent",
+            "chess-echo-implementer",
+            "--evidence",
+            evidence_path,
+        )
+
+        self.assertEqual(1, code)
+        self.assertEqual("implementation-scope-drift", payload["error"]["code"])
 
     def test_reanchor_target_rejects_dirty_worktree(self):
         """Re-anchoring never inspects or changes a dirty working tree."""
