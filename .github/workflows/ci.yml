@@ -1,8 +1,10 @@
 name: Fidenaut workflow tests
 
 on:
-  push:
   pull_request:
+  push:
+    branches:
+      - main
 
 jobs:
   workflow-tests:
