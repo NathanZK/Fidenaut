@@ -1157,6 +1157,47 @@ def _require_publishable_head(root, config, context, expected_branch=None):
     return branch
 
 
+def _attach_recorded_publication_branch(root, config, state, context):
+    """Restore the recorded branch attachment without changing its ref."""
+    expected_branch = state.get("publication_branch")
+    _ensure(
+        isinstance(expected_branch, str) and expected_branch.strip(),
+        "invalid-publication-head",
+        "%s requires a recorded publication branch" % context,
+    )
+    current_branch = _current_branch(root, config)
+    if current_branch is None:
+        current_head = _current_head(root, config)
+        branch_result = _run_bounded(
+            _git_command(
+                config,
+                "rev-parse",
+                "--verify",
+                "refs/heads/%s^{commit}" % expected_branch,
+            ),
+            _effective_limits(config, "git"),
+            root,
+        )
+        _ensure(
+            branch_result["result"].get("outcome") == "success"
+            and branch_result["result"].get("exit_code") == 0
+            and branch_result["stdout_text"].strip() == current_head,
+            "invalid-publication-head",
+            "%s detached HEAD does not match recorded publication branch %s"
+            % (context, expected_branch),
+        )
+        _run_checked(
+            _git_command(config, "checkout", "-q", expected_branch),
+            _effective_limits(config, "git"),
+            root,
+            "git-checkout-failed",
+            "%s could not attach recorded publication branch" % context,
+        )
+    return _require_publishable_head(
+        root, config, context, expected_branch=expected_branch
+    )
+
+
 def _resolve_target_head(root, config, fetch=False):
     if fetch and _remote_exists(root, config):
         _require_authoritative_remote(root, config, "resolve-target-head")
@@ -1535,6 +1576,12 @@ def _reconcile_candidate_artifacts(root, config, state, old_target, new_target, 
         "implementation-commit-not-allowed",
         "%s requires HEAD to match approved test_commit" % context,
     )
+    publication_branch = _current_branch(root, config)
+    _ensure(
+        publication_branch,
+        "invalid-publication-head",
+        "%s requires an attached publication branch" % context,
+    )
     _require_clean_index(root, config, context)
     _git_ancestor(root, config, old_target, test_commit, context)
 
@@ -1603,7 +1650,14 @@ def _reconcile_candidate_artifacts(root, config, state, old_target, new_target, 
 
     try:
         _run_checked(
-            _git_command(config, "rebase", "--onto", new_target, old_target, original_candidate_commit),
+            _git_command(
+                config,
+                "rebase",
+                "--onto",
+                new_target,
+                old_target,
+                publication_branch,
+            ),
             _effective_limits(config, "git"),
             root,
             "git-rebase-failed",
@@ -1889,6 +1943,9 @@ def command_reconcile_candidate(args, root, config):
         not state.get("implementation_commit") and not state.get("draft_pr"),
         "invalid-transition",
         "reconcile-candidate is not allowed after publication artifacts exist",
+    )
+    _attach_recorded_publication_branch(
+        root, config, state, "reconcile-candidate"
     )
 
     old_target = _state_target_head(state)
