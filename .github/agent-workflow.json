@@ -158,6 +158,16 @@
           "cwd": "."
         }
       ]
+    },
+    "provider-workflow-tooling": {
+      "test_paths": ["scripts/tests/**/*"],
+      "checks": [
+        {
+          "name": "agent-workflow-tests",
+          "command": ["python3", "scripts/run_agent_workflow_tests.py"],
+          "cwd": "."
+        }
+      ]
     }
   }
 }

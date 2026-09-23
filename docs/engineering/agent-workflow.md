@@ -891,6 +891,25 @@ Deterministic outcomes:
   unsupported partial shape) fails closed without mutating the completed run or
   draft PR.
 
+### Provider and consumer validation profiles
+
+`validation_profiles` in `.github/agent-workflow.json` is a flat, additive
+namespace of named profiles; no script or CI workflow hardcodes a profile
+name, so adding a profile never touches role, approval, evidence, or
+state-machine code. Most entries (`backend`, `frontend`, `full-stack`,
+`workflow-tooling`) describe ChessEcho's own build and test commands and
+remain ChessEcho's — the reference consumer's — deliberate configuration.
+
+`provider-workflow-tooling` is the one profile owned by Fidenaut itself: its
+`test_paths` (`scripts/tests/**/*`) match Fidenaut's own workflow-tooling test
+suite, and its check runs the same command Fidenaut's CI already executes
+directly, `python3 scripts/run_agent_workflow_tests.py` (see
+`.github/workflows/ci.yml` and `scripts/run_agent_workflow_tests.py`), with no
+dependency on a Makefile or any consumer application build. Selecting it via
+`run-validation ISSUE --profile provider-workflow-tooling` runs Fidenaut's own
+tests through the same unmodified `run-validation` code path, approval
+semantics, and evidence model as every other profile.
+
 ### Validation setup
 
 A fresh Git worktree — whether the normal workflow worktree used by
