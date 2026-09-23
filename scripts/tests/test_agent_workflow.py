@@ -2005,6 +2005,39 @@ class AgentWorkflowTest(unittest.TestCase):
         self.git("remote", "add", "origin", str(bare_path))
         return self.git("remote", "get-url", "origin").stdout.strip()
 
+    def repository_workflow_config(self):
+        repo_root = pathlib.Path(__file__).resolve().parents[2]
+        return workflow._load_config(repo_root)
+
+    def test_fidenaut_repository_config_authorizes_fidenaut_origin(self):
+        """The published Fidenaut config trusts Fidenaut, including SSH origin syntax."""
+        config = self.repository_workflow_config()
+        self.git("remote", "add", "origin", "git@github.com:NathanZK/Fidenaut.git")
+
+        resolved_identity = workflow._require_authoritative_remote(
+            self.root, config, "repository-config-test"
+        )
+
+        self.assertEqual("github.com/NathanZK/Fidenaut", config["authoritative_remote"])
+        self.assertEqual("github.com/nathanzk/fidenaut", resolved_identity)
+        repository = workflow._authoritative_repository(config)
+        self.assertEqual("nathanzk/fidenaut", repository)
+        self.assertTrue(
+            workflow._repository_identities_match(repository, "NathanZK/Fidenaut")
+        )
+
+    def test_fidenaut_repository_config_rejects_chessecho_origin(self):
+        """A ChessEcho origin must not satisfy Fidenaut's authoritative repository."""
+        config = self.repository_workflow_config()
+        self.git("remote", "add", "origin", "git@github.com:NathanZK/ChessEcho.git")
+
+        with self.assertRaises(workflow.WorkflowError) as caught:
+            workflow._require_authoritative_remote(
+                self.root, config, "repository-config-test"
+            )
+
+        self.assertEqual("remote-not-authoritative", caught.exception.code)
+
     def test_init_succeeds_with_correctly_configured_authoritative_remote(self):
         """A real origin matching the configured authoritative identity is trusted."""
         resolved = self.add_real_origin_remote()
