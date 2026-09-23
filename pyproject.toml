@@ -1,0 +1,20 @@
+[tool.ruff]
+target-version = "py39"
+line-length = 88
+src = ["scripts"]
+# Excludes the pre-existing governed workflow implementation and its existing
+# tests: those files are explicitly out of scope for modification by the
+# lint-integration issue, so pre-existing style in them is intentionally not
+# enforced here rather than rewritten as unrelated cleanup. New and touched
+# provider Python files (including this lint entrypoint and its regression
+# test) remain linted.
+extend-exclude = [
+    "scripts/agent_workflow.py",
+    "scripts/workflow_supervisor.py",
+    "scripts/tests/test_agent_workflow.py",
+    "scripts/tests/test_workflow_supervisor.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F"]
+
