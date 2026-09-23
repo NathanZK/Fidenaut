@@ -2603,6 +2603,30 @@ class AgentWorkflowTest(unittest.TestCase):
             provenance["target_drift"],
         )
 
+    def test_reconcile_candidate_reattaches_recorded_publication_branch(self):
+        """Successful reconciliation must not leave publication HEAD detached."""
+        self.bootstrap_to_validation()
+        publication_branch = self.state()["publication_branch"]
+        test_commit = self.state()["test_commit"]
+        self.git("checkout", "-q", "--detach", test_commit)
+        remote_head = self.advance_remote_target()
+
+        code, payload, _ = self.run_cli(
+            "reconcile-candidate",
+            str(ISSUE),
+            "--by",
+            "owner",
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("VALIDATION", payload["status"])
+        self.assertEqual(publication_branch, self.git("branch", "--show-current").stdout.strip())
+        self.assertEqual(remote_head, self.state()["target_head"])
+        self.assertEqual(
+            self.git("rev-parse", publication_branch).stdout.strip(),
+            self.git("rev-parse", "HEAD").stdout.strip(),
+        )
+
     def test_reconcile_candidate_rejects_non_descendant_remote(self):
         """Candidate reconciliation rejects unrelated target ancestry."""
         self.bootstrap_to_validation()
