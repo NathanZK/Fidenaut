@@ -1,0 +1,21 @@
+name: Fidenaut workflow tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  workflow-tests:
+    name: workflow-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        # v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Set up Python
+        # v5.6.0
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.9"
+      - name: Run provider workflow tests
+        run: python3 scripts/run_agent_workflow_tests.py
