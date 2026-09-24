@@ -65,6 +65,7 @@ def supervisor_result(outcome="success", exit_code=0, stderr=""):
 class AgentWorkflowTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
+        self.provider_manifest_temporary = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temporary.name)
         (self.root / ".github").mkdir(parents=True)
         (self.root / "artifacts-src").mkdir(parents=True)
@@ -84,6 +85,7 @@ class AgentWorkflowTest(unittest.TestCase):
         self.git("update-ref", "refs/remotes/origin/main", "HEAD")
 
     def tearDown(self):
+        self.provider_manifest_temporary.cleanup()
         self.temporary.cleanup()
 
     def test_reviewer_contract_requires_direct_acceptance_criterion_evidence(self):
@@ -2582,6 +2584,94 @@ class AgentWorkflowTest(unittest.TestCase):
         with self.assertRaises(workflow.WorkflowError) as ctx:
             workflow._require_clean_tree(self.root, config, "workflow-check")
         self.assertEqual("git-worktree-dirty", ctx.exception.code)
+
+    def provider_runtime(self, files):
+        """Materialize provider inputs and an out-of-tree immutable manifest."""
+        manifest_root = pathlib.Path(self.provider_manifest_temporary.name)
+        entries = []
+        for relative_path, content in files.items():
+            path = self.root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            entries.append(
+                {
+                    "path": relative_path,
+                    "mode": "100644",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            )
+        manifest = manifest_root / "provider-runtime-manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "format": workflow.PROVIDER_RUNTIME_MANIFEST_FORMAT,
+                    "provider": {
+                        "repository": "github.com/NathanZK/Fidenaut",
+                        "revision": "012e7d76a49e9e0fe33b1d17eb70769c2d4520f3",
+                    },
+                    "files": entries,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return manifest
+
+    def test_verified_provider_runtime_is_excluded_without_masking_consumer_changes(self):
+        """Pinned provider files are trusted inputs, while consumer edits remain dirty."""
+        manifest = self.provider_runtime(
+            {"scripts/provider_runtime.py": b"provider runtime\n"}
+        )
+        config = self.repository_workflow_config()
+        with mock.patch.dict(
+            os.environ,
+            {"FIDENAUT_PROVIDER_RUNTIME_MANIFEST": str(manifest)},
+            clear=False,
+        ):
+            self.assertEqual([], workflow._git_status(self.root, config))
+            self.assertEqual(
+                [],
+                workflow._git_candidate_names(
+                    self.root, config, "HEAD"
+                ),
+            )
+            (self.root / "consumer.txt").write_text("consumer change\n", encoding="utf-8")
+            self.assertEqual(["?? consumer.txt"], workflow._git_status(self.root, config))
+
+    def test_provider_runtime_tampering_fails_closed(self):
+        """Changing a provider-owned file never becomes an ignored consumer change."""
+        manifest = self.provider_runtime(
+            {"scripts/provider_runtime.py": b"provider runtime\n"}
+        )
+        (self.root / "scripts/provider_runtime.py").write_bytes(b"tampered\n")
+        config = self.repository_workflow_config()
+        with mock.patch.dict(
+            os.environ,
+            {"FIDENAUT_PROVIDER_RUNTIME_MANIFEST": str(manifest)},
+            clear=False,
+        ):
+            with self.assertRaises(workflow.WorkflowError) as ctx:
+                workflow._git_status(self.root, config)
+        self.assertEqual("provider-runtime-integrity-mismatch", ctx.exception.code)
+
+    def test_provider_runtime_manifest_cannot_be_consumer_controlled(self):
+        """A manifest inside the consumer worktree is rejected as an authority source."""
+        provider_path = self.root / "scripts/provider_runtime.py"
+        provider_path.parent.mkdir(parents=True, exist_ok=True)
+        provider_path.write_bytes(b"provider runtime\n")
+        manifest = self.root / ".agent-workflow" / "provider-runtime-manifest.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text("{}", encoding="utf-8")
+        config = self.repository_workflow_config()
+        with mock.patch.dict(
+            os.environ,
+            {"FIDENAUT_PROVIDER_RUNTIME_MANIFEST": str(manifest)},
+            clear=False,
+        ):
+            with self.assertRaises(workflow.WorkflowError) as ctx:
+                workflow._git_status(self.root, config)
+        self.assertEqual("invalid-provider-runtime-manifest", ctx.exception.code)
 
     def test_reanchor_target_rejects_dirty_worktree(self):
         """Re-anchoring never inspects or changes a dirty working tree."""

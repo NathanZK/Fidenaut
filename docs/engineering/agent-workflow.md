@@ -43,6 +43,19 @@ with:
   already-published completed run is reconciled onto an advanced target or
   escalated into an automatic governed revision)
 
+  ### External provider runtime boundary
+
+  An external consumer may materialize a pinned Fidenaut runtime into its
+  disposable worktree without committing provider files to the consumer. The
+  runtime manifest is supplied through the
+  `FIDENAUT_PROVIDER_RUNTIME_MANIFEST` environment variable and must reside
+  outside the consumer worktree. Its provider revision and every listed path,
+  mode, and SHA-256 are verified before provider paths are excluded from
+  consumer clean-tree or candidate calculations. The manifest identity is
+  captured at `init` and every later state read requires the same identity.
+  Missing, malformed, relocated, changed, or tampered provider inputs fail
+  closed; provider paths are not an authorization or candidate-scope bypass.
+
 The transition journals are created only after each gate's existing
 preconditions pass and after the exact local acknowledgment is accepted, but
 before the workflow-owned `git commit` (and, for Gate 3, before any `git add`
