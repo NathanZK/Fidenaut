@@ -264,31 +264,9 @@ class AgentWorkflowTest(unittest.TestCase):
         return path
 
     def git_candidate_diff(self, test_commit):
-        tracked = self.git("diff", "--binary", test_commit, "--").stdout
-        status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=all"],
-            cwd=self.root,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        ).stdout
-        additions = []
-        for line in status.splitlines():
-            if not line.startswith("?? "):
-                continue
-            path = line[3:]
-            completed = subprocess.run(
-                ["git", "diff", "--binary", "--no-index", "--", "/dev/null", path],
-                cwd=self.root,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            self.assertIn(completed.returncode, (0, 1), completed.stderr)
-            additions.append(completed.stdout)
-        return tracked + "".join(additions)
+        return workflow._git_candidate_diff(
+            self.root, self.repository_workflow_config(), test_commit
+        )
 
     def write_evidence(
         self,
@@ -2672,6 +2650,92 @@ class AgentWorkflowTest(unittest.TestCase):
             with self.assertRaises(workflow.WorkflowError) as ctx:
                 workflow._git_status(self.root, config)
         self.assertEqual("invalid-provider-runtime-manifest", ctx.exception.code)
+
+    def test_approve_implementation_excludes_verified_provider_runtime_from_commit(self):
+        """Commit construction must keep provider-owned overlay files out of consumer commits."""
+        manifest = self.provider_runtime(
+            {"scripts/provider_runtime.py": b"provider runtime\n"}
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"FIDENAUT_PROVIDER_RUNTIME_MANIFEST": str(manifest)},
+            clear=False,
+        ):
+            self.bootstrap_to_reviewed_implementation()
+            code, payload, _ = self.approve_implementation()
+
+        self.assertEqual(0, code)
+        implementation_commit = payload["implementation_commit"]
+        state = self.state()
+        self.assertEqual("DRAFT_PR_CREATION", state["status"])
+        self.assertEqual(implementation_commit, state["implementation_commit"])
+        committed_paths = sorted(
+            line.strip()
+            for line in self.git(
+                "diff",
+                "--name-only",
+                "%s..%s" % (state["target_head"], implementation_commit),
+            ).stdout.splitlines()
+            if line.strip()
+        )
+        self.assertEqual(
+            ["src/Example.kt", "src/test/ExampleTest.kt"],
+            committed_paths,
+        )
+        self.assertNotIn(
+            "scripts/provider_runtime.py",
+            self.git(
+                "show",
+                "--name-only",
+                "--format=",
+                implementation_commit,
+            ).stdout.splitlines(),
+        )
+
+    def test_approve_implementation_provider_runtime_integrity_fails_closed(self):
+        """Tampered provider files must fail before implementation state is finalized."""
+        manifest = self.provider_runtime(
+            {"scripts/provider_runtime.py": b"provider runtime\n"}
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"FIDENAUT_PROVIDER_RUNTIME_MANIFEST": str(manifest)},
+            clear=False,
+        ):
+            self.bootstrap_to_reviewed_implementation()
+            before = self.state()
+            head_before = self.git("rev-parse", "HEAD").stdout.strip()
+            (self.root / "scripts/provider_runtime.py").write_bytes(b"tampered\n")
+            code, payload, _ = self.approve_implementation()
+
+        self.assertEqual(1, code)
+        self.assertEqual("provider-runtime-integrity-mismatch", payload["error"]["code"])
+        self.assertEqual(before, self.state())
+        self.assertEqual(head_before, self.git("rev-parse", "HEAD").stdout.strip())
+
+    def test_approve_implementation_scope_drift_still_fails_with_provider_runtime(self):
+        """Provider filtering must not hide unrelated consumer implementation changes."""
+        manifest = self.provider_runtime(
+            {"scripts/provider_runtime.py": b"provider runtime\n"}
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"FIDENAUT_PROVIDER_RUNTIME_MANIFEST": str(manifest)},
+            clear=False,
+        ):
+            self.bootstrap_to_reviewed_implementation()
+            before = self.state()
+            head_before = self.git("rev-parse", "HEAD").stdout.strip()
+            (self.root / "unapproved.txt").write_text("consumer drift\n", encoding="utf-8")
+            code, payload, _ = self.approve_implementation()
+
+        self.assertEqual(1, code)
+        self.assertEqual("implementation-scope-drift", payload["error"]["code"])
+        self.assertEqual(before, self.state())
+        self.assertEqual(head_before, self.git("rev-parse", "HEAD").stdout.strip())
 
     def test_reanchor_target_rejects_dirty_worktree(self):
         """Re-anchoring never inspects or changes a dirty working tree."""
