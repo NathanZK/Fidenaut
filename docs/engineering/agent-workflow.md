@@ -753,9 +753,46 @@ Eligibility and inheritance rules:
 - `--class test` additionally requires the parent's tests to have been
   `REQUIRED` (not `NOT_APPLICABLE`) — there is no test boundary to correct
   otherwise.
-- `ISSUE` must not already have a run, and HEAD must already be at the
-  current authoritative `target_head` (the same starting condition as
-  `init`).
+- `ISSUE` must not already have a run. For a parent whose implementation is
+  already reachable from the target branch (the ordinary merged case), HEAD
+  must already be at the current authoritative `target_head` — the same
+  starting condition as `init`.
+- For a parent that is exactly `WORKFLOW_COMPLETED` whose implementation has
+  **not** merged, the target branch is the eventual merge target, not the
+  starting point. `start-revision` instead anchors the revision to the
+  parent's completed implementation candidate on the parent's recorded
+  publication branch:
+
+  ```text
+  WORKFLOW_COMPLETED -> completed implementation candidate
+    -> governed draft publication branch -> start-revision
+    -> new revision run anchored to that exact completed implementation
+  ```
+
+  Whether this applies is decided by real Git ancestry, never by a flag or a
+  claim. The anchored start is read-only — it moves no ref, touches no PR,
+  and leaves the completed parent run byte-identical — and it fails closed
+  unless all of the following hold: the parent is `WORKFLOW_COMPLETED`
+  (`unmerged-parent-not-completed`); the class is `cosmetic` or
+  `implementation`, the only classes that inherit the parent's approved test
+  boundary (`unsupported-unmerged-revision-class`); the parent recorded a
+  non-target `publication_branch` (`invalid-publication-head`); the target
+  branch is still at the parent's approved base, otherwise
+  `reconcile-completed-run` is the governed command
+  (`revision-target-advanced`); the completed implementation is still the
+  single direct child of that base (`invalid-implementation-topology`);
+  `refs/heads/<publication_branch>` resolves to exactly that implementation
+  (`publication-branch-drift`); any recorded parent draft PR head is exactly
+  that implementation (`parent-publication-identity-mismatch`); the worktree
+  is attached to exactly that branch, not detached and not an unrelated
+  branch at the same commit (`invalid-publication-head`); and HEAD resolves
+  to exactly that implementation (`workflow-start-not-at-publication`). The
+  new run records the anchor under `parent_run.publication_anchor`, keeps
+  `target_head`/`base_head` at the eventual merge target, and enters its
+  class's entry status, so it is a distinct run that is never
+  `WORKFLOW_COMPLETED` while implementation work happens. Its publication
+  counterpart is `publish-pr-revision`, which revises the parent's existing
+  draft PR after re-verifying that PR's live identity.
 - Every revision class **inherits the parent's approved plan and approved
   scope by exact content** — never re-typed, never re-approved from
   scratch — and enters the workflow at the class's entry boundary:
@@ -768,11 +805,16 @@ Eligibility and inheritance rules:
   boundary cannot be reused by SHA (the parent's `test_commit` is a sibling
   of the parent's squashed `implementation_commit`, not an ancestor of the
   new target). Instead, `start-revision` independently verifies — via a real
-  `git diff` against the current target — that the approved test file
-  content is byte-identical to what was approved, and only then treats the
-  current target itself as the (trivially satisfied) inherited test
-  boundary. Any drift fails closed with `inherited-test-content-drift`
-  rather than silently trusting stale test content.
+  `git diff` against the inherited boundary — that the approved test file
+  content is byte-identical to what was approved, and only then treats that
+  boundary as the (trivially satisfied) inherited test boundary. For a merged
+  parent the inherited boundary is the current target; for a publication
+  anchored revision it is the parent's completed implementation commit, whose
+  approved production paths are then part of the boundary that
+  `approve-implementation` re-derives from Git when it checks the final
+  squashed commit's path set. Any drift fails closed with
+  `inherited-test-content-drift` rather than silently trusting stale test
+  content.
 - The claimed `--class` is only a request, not a bypass:
   `submit-implementation` independently derives the narrowest required
   boundary from the parent implementation, approved scope/plan identity,

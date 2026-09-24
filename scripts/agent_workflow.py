@@ -3318,7 +3318,21 @@ def _verify_authoritative_implementation(
     if test_commit == target_head:
         expected_names = sorted(set(candidate_paths))
     else:
-        expected_names = sorted(set(test_paths).union(candidate_paths))
+        # Every path introduced between the verified target and the verified
+        # approved boundary is already part of that boundary. For an ordinary
+        # run this is exactly the approved test paths; for a revision anchored
+        # on an unmerged completed implementation it additionally contains the
+        # parent's approved production paths. Both are verified Git facts, and
+        # the approved test paths must remain a subset of them.
+        boundary_names = _git_diff_names(
+            root, config, "%s..%s" % (target_head, test_commit)
+        )
+        _ensure(
+            set(test_paths).issubset(boundary_names),
+            "approved-test-boundary-mismatch",
+            "%s approved test paths are not contained in the approved boundary" % context,
+        )
+        expected_names = sorted(set(boundary_names).union(candidate_paths))
     _ensure(
         final_names == expected_names,
         "implementation-scope-drift",
@@ -4538,6 +4552,129 @@ def command_init(args, root, config):
     return {"ok": True, "issue": args.issue, "status": state["status"], "run_dir": _relative(run, root)}
 
 
+def _publication_anchor_applies(root, config, parent_state, target_head):
+    """Return True when the parent's completed implementation has not merged.
+
+    The discriminator is real Git ancestry, never a caller assertion: a
+    parent whose implementation is already reachable from the target keeps
+    the ordinary target-anchored start condition.
+    """
+    implementation_commit = parent_state.get("implementation_commit")
+    if not implementation_commit:
+        return False
+    completed = _run_bounded(
+        _git_command(
+            config, "merge-base", "--is-ancestor", implementation_commit, target_head
+        ),
+        _effective_limits(config, "git"),
+        root,
+    )
+    result = completed["result"]
+    _ensure(
+        result.get("outcome") in ("success", "nonzero-exit"),
+        "invalid-git-ancestry",
+        "start-revision could not compare the parent implementation to %s"
+        % config["target_base"],
+    )
+    return not (
+        result.get("outcome") == "success" and result.get("exit_code") == 0
+    )
+
+
+def _require_unmerged_publication_anchor(
+    root, config, parent_state, revision_class, target_head, context
+):
+    """Bind a revision to a completed-but-unmerged parent's publication head.
+
+    Every fact is taken from the parent run's own recorded evidence and then
+    independently re-verified against real refs. Nothing here writes, moves,
+    or rewrites any ref, PR, or parent run state.
+    """
+    _ensure(
+        parent_state["status"] == "WORKFLOW_COMPLETED",
+        "unmerged-parent-not-completed",
+        "%s requires an unmerged parent to be WORKFLOW_COMPLETED (current: %s)"
+        % (context, parent_state["status"]),
+    )
+    # Only classes that inherit the parent's approved test boundary can build
+    # on the completed implementation. A `test` or `plan` revision must
+    # re-establish that boundary against the target, which an unmerged parent
+    # cannot provide, so it fails closed here instead of creating a run that
+    # could never satisfy its own next gate.
+    _ensure(
+        revision_class in ("cosmetic", "implementation"),
+        "unsupported-unmerged-revision-class",
+        "%s supports only cosmetic/implementation revisions of an unmerged completed parent (requested: %s)"
+        % (context, revision_class),
+    )
+    implementation_commit = parent_state.get("implementation_commit")
+    publication_branch = parent_state.get("publication_branch")
+    _ensure(
+        isinstance(publication_branch, str)
+        and publication_branch.strip()
+        and publication_branch != config["target_base"],
+        "invalid-publication-head",
+        "%s requires the parent run to have a recorded non-target publication branch"
+        % context,
+    )
+    parent_target_head = parent_state.get("target_head")
+    _ensure(
+        parent_target_head == target_head,
+        "revision-target-advanced",
+        "%s requires target branch %s to remain at the parent's approved base %s; "
+        "use reconcile-completed-run for an advanced target"
+        % (context, config["target_base"], parent_target_head),
+    )
+    # The completed implementation must still be exactly the single squashed
+    # commit that was approved directly on that target base.
+    _require_direct_child(root, config, target_head, implementation_commit, context)
+    _require_single_commit(root, config, target_head, implementation_commit, context)
+
+    branch_result = _run_bounded(
+        _git_command(
+            config, "rev-parse", "--verify", "refs/heads/%s^{commit}" % publication_branch
+        ),
+        _effective_limits(config, "git"),
+        root,
+    )
+    result = branch_result["result"]
+    _ensure(
+        result.get("outcome") == "success"
+        and result.get("exit_code") == 0
+        and branch_result["stdout_text"].strip() == implementation_commit,
+        "publication-branch-drift",
+        "%s requires publication branch %s to resolve to the completed implementation %s"
+        % (context, publication_branch, implementation_commit),
+    )
+
+    draft_pr = parent_state.get("draft_pr")
+    if isinstance(draft_pr, dict) and draft_pr.get("head_ref_oid"):
+        _ensure(
+            draft_pr["head_ref_oid"] == implementation_commit,
+            "parent-publication-identity-mismatch",
+            "%s requires the recorded draft PR head to be the completed implementation %s"
+            % (context, implementation_commit),
+        )
+
+    # Attachment, target-branch exclusion, and authoritative-remote identity
+    # are re-checked here against the caller's real worktree; a detached HEAD
+    # or an unrelated branch at the same commit fails closed.
+    _require_publishable_head(root, config, context, expected_branch=publication_branch)
+    _ensure(
+        _current_head(root, config) == implementation_commit,
+        "workflow-start-not-at-publication",
+        "%s requires HEAD to match the completed implementation %s on publication branch %s"
+        % (context, implementation_commit, publication_branch),
+    )
+    return {
+        "publication_branch": publication_branch,
+        "implementation_commit": implementation_commit,
+        "target_head": target_head,
+        "parent_draft_pr": draft_pr,
+        "anchored_at": _now(),
+    }
+
+
 def _start_revision_run(
     root,
     config,
@@ -4550,6 +4687,7 @@ def _start_revision_run(
     resolved_target_head=None,
     context="start-revision",
     inherit_parent_test_commit_verbatim=False,
+    allow_publication_anchor=False,
 ):
     """Link a new run to an eligible parent run for a bounded governed revision.
 
@@ -4586,14 +4724,28 @@ def _start_revision_run(
     # Completed-run reconciliation validates its temporary detached scratch
     # checkout separately; the durable publication binding belongs to the
     # caller's authoritative checkout.
-    publication_branch = _require_publishable_head(root, config, context)
-    initial_head = _current_head(git_root, config)
+    publication_anchor = None
     target_head = resolved_target_head or _resolve_target_head(git_root, config, fetch=True)
-    _ensure(
-        initial_head == target_head,
-        "workflow-start-not-at-target",
-        "start-revision requires HEAD to match target branch %s at %s" % (config["target_base"], target_head),
-    )
+    if allow_publication_anchor and _publication_anchor_applies(
+        root, config, parent_state, target_head
+    ):
+        # The parent completed but its implementation has not merged: the only
+        # correct starting point is that exact completed implementation on the
+        # parent's recorded publication branch. The target branch remains the
+        # eventual merge target, not the revision's starting point.
+        publication_anchor = _require_unmerged_publication_anchor(
+            root, config, parent_state, revision_class, target_head, context
+        )
+        publication_branch = publication_anchor["publication_branch"]
+        initial_head = publication_anchor["implementation_commit"]
+    else:
+        publication_branch = _require_publishable_head(root, config, context)
+        initial_head = _current_head(git_root, config)
+        _ensure(
+            initial_head == target_head,
+            "workflow-start-not-at-target",
+            "start-revision requires HEAD to match target branch %s at %s" % (config["target_base"], target_head),
+        )
 
     parent_scope = parent_state.get("approved_scope") or []
     parent_test_paths = []
@@ -4619,9 +4771,23 @@ def _start_revision_run(
             "parent-run-missing-test-commit",
             "start-revision requires the parent run's test_commit to verify inherited test content",
         )
+        # With a publication anchor the inherited boundary is the parent's own
+        # completed implementation, so the approved test content is verified
+        # against that exact commit instead of the (unmerged) target.
+        inherited_boundary = (
+            publication_anchor["implementation_commit"]
+            if publication_anchor
+            else target_head
+        )
         test_content_check = _run_bounded(
             _git_command(
-                config, "diff", "--quiet", parent_test_commit, target_head, "--", *parent_test_paths
+                config,
+                "diff",
+                "--quiet",
+                parent_test_commit,
+                inherited_boundary,
+                "--",
+                *parent_test_paths
             ),
             _effective_limits(config, "git"),
             root,
@@ -4630,7 +4796,7 @@ def _start_revision_run(
         _ensure(
             result.get("outcome") == "success" and result.get("exit_code") == 0,
             "inherited-test-content-drift",
-            "start-revision requires the approved test content to be unchanged in the current target",
+            "start-revision requires the approved test content to be unchanged in the inherited boundary",
         )
 
     _artifacts_dir(root, config, issue).mkdir(parents=True, exist_ok=True)
@@ -4668,6 +4834,8 @@ def _start_revision_run(
             "parent_test_paths": parent_test_paths,
         },
     }
+    if publication_anchor:
+        state["parent_run"]["publication_anchor"] = publication_anchor
 
     if revision_class in ("cosmetic", "implementation"):
         # Plan and tests remain the trusted, unrevised boundary: copy the
@@ -4684,11 +4852,17 @@ def _start_revision_run(
         state["approved_scope"] = parent_scope
         state["approvals"]["plan"] = parent_state["approvals"].get("plan")
         state["approvals"]["tests"] = parent_state["approvals"].get("tests")
-        state["test_commit"] = (
-            parent_state.get("test_commit")
-            if inherit_parent_test_commit_verbatim and parent_test_paths
-            else target_head if parent_test_paths else parent_state.get("test_commit")
-        )
+        if publication_anchor:
+            # The parent's completed implementation already contains the
+            # approved test content verified above, so it is itself the
+            # inherited boundary the revision builds on.
+            state["test_commit"] = publication_anchor["implementation_commit"]
+        elif inherit_parent_test_commit_verbatim and parent_test_paths:
+            state["test_commit"] = parent_state.get("test_commit")
+        elif parent_test_paths:
+            state["test_commit"] = target_head
+        else:
+            state["test_commit"] = parent_state.get("test_commit")
         state["test_implementation_status"] = parent_state.get("test_implementation_status")
         state["test_implementation_reason"] = parent_state.get("test_implementation_reason")
     elif revision_class == "test":
@@ -4753,6 +4927,7 @@ def command_start_revision(args, root, config):
         args.parent_issue,
         args.revision_class,
         args.by,
+        allow_publication_anchor=True,
     )
 
 
