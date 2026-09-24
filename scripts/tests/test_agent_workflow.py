@@ -9699,6 +9699,351 @@ class RevisionAndPrRevisionTest(AgentWorkflowTest):
         )
 
 
+class UnmergedCompletedRevisionAnchorTest(AgentWorkflowTest):
+    """Issue #24: an implementation revision of an unmerged WORKFLOW_COMPLETED
+    parent anchors to that parent's recorded publication branch and completed
+    implementation, never to the target branch."""
+
+    PARENT_ISSUE = 9101
+    CHILD_ISSUE = 9102
+
+    state_for = RevisionAndPrRevisionTest.state_for
+    write_state_for = RevisionAndPrRevisionTest.write_state_for
+    bootstrap_completed_parent = RevisionAndPrRevisionTest.bootstrap_completed_parent
+    advance_main_past = RevisionAndPrRevisionTest.advance_main_past
+    set_parent_draft_pr = RevisionAndPrRevisionTest.set_parent_draft_pr
+
+    def start_revision(self, revision_class="implementation"):
+        return self.run_cli(
+            "start-revision",
+            str(self.CHILD_ISSUE),
+            "--parent-issue",
+            str(self.PARENT_ISSUE),
+            "--class",
+            revision_class,
+            "--by",
+            "tester",
+        )
+
+    def assert_no_child_run(self):
+        self.assertFalse(
+            (
+                self.root / ".agent-workflow" / "runs" / f"issue-{self.CHILD_ISSUE}"
+            ).exists()
+        )
+
+    def test_unmerged_completed_parent_anchors_revision_to_publication_branch(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        implementation_commit = parent_state["implementation_commit"]
+        target_head = self.git("rev-parse", "origin/main").stdout.strip()
+        self.assertNotEqual(target_head, implementation_commit)
+
+        code, payload, _ = self.start_revision()
+
+        self.assertEqual(0, code)
+        self.assertEqual("IMPLEMENTATION", payload["status"])
+        child_state = self.state_for(self.CHILD_ISSUE)
+        self.assertEqual(implementation_commit, child_state["initial_head"])
+        self.assertEqual(implementation_commit, child_state["test_commit"])
+        self.assertEqual(
+            parent_state["publication_branch"], child_state["publication_branch"]
+        )
+        # The target branch stays the eventual merge target, not the start point.
+        self.assertEqual(target_head, child_state["target_head"])
+        self.assertEqual(target_head, child_state["base_head"])
+        anchor = child_state["parent_run"]["publication_anchor"]
+        self.assertEqual(implementation_commit, anchor["implementation_commit"])
+        self.assertEqual(
+            parent_state["publication_branch"], anchor["publication_branch"]
+        )
+        self.assertEqual(target_head, anchor["target_head"])
+        self.assertEqual(
+            implementation_commit,
+            child_state["parent_run"]["parent_implementation_commit"],
+        )
+        self.assertEqual(
+            parent_state["approved_scope"], child_state["approved_scope"]
+        )
+        self.assertIsNotNone(child_state["approvals"]["plan"])
+        self.assertIsNotNone(child_state["approvals"]["tests"])
+
+    def test_revision_start_leaves_completed_state_without_mutating_parent(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        branch_before = self.git(
+            "rev-parse", parent_state["publication_branch"]
+        ).stdout.strip()
+
+        self.assertEqual(0, self.start_revision()[0])
+
+        child_state = self.state_for(self.CHILD_ISSUE)
+        self.assertNotEqual("WORKFLOW_COMPLETED", child_state["status"])
+        self.assertEqual("IMPLEMENTATION", child_state["status"])
+        self.assertIsNone(child_state["implementation_commit"])
+        self.assertIsNone(child_state["draft_pr"])
+        # The completed parent run is preserved exactly, and no ref moved.
+        self.assertEqual(parent_state, self.state_for(self.PARENT_ISSUE))
+        self.assertEqual(
+            branch_before,
+            self.git("rev-parse", parent_state["publication_branch"]).stdout.strip(),
+        )
+        self.assertEqual(
+            branch_before, self.git("rev-parse", "HEAD").stdout.strip()
+        )
+
+    def test_unmerged_revision_rejects_start_from_target_branch_commit(self):
+        """Being at origin/main is not a valid start for an unmerged parent."""
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        target_head = self.git("rev-parse", "origin/main").stdout.strip()
+        self.git("checkout", "-q", "-b", "other-branch", target_head)
+
+        code, payload, _ = self.start_revision()
+
+        self.assertEqual(1, code)
+        self.assertEqual("invalid-publication-head", payload["error"]["code"])
+        self.assertNotEqual(
+            target_head, parent_state["implementation_commit"]
+        )
+        self.assert_no_child_run()
+
+    def test_unmerged_revision_rejects_detached_head(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        self.git("checkout", "-q", "--detach", parent_state["implementation_commit"])
+
+        code, payload, _ = self.start_revision()
+
+        self.assertEqual(1, code)
+        self.assertEqual("invalid-publication-head", payload["error"]["code"])
+        self.assert_no_child_run()
+
+    def test_unmerged_revision_rejects_unrelated_branch_at_same_commit(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        self.git(
+            "checkout", "-q", "-b", "look-alike", parent_state["implementation_commit"]
+        )
+
+        code, payload, _ = self.start_revision()
+
+        self.assertEqual(1, code)
+        self.assertEqual("invalid-publication-head", payload["error"]["code"])
+        self.assert_no_child_run()
+
+    def test_unmerged_revision_rejects_moved_publication_branch(self):
+        self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        (self.root / "docs" / "example.md").write_text(
+            "# Example\n\nlater unreviewed work\n", encoding="utf-8"
+        )
+        self.git("add", "docs/example.md")
+        self.git("commit", "-qm", "unreviewed follow-up commit")
+
+        code, payload, _ = self.start_revision()
+
+        self.assertEqual(1, code)
+        self.assertEqual("publication-branch-drift", payload["error"]["code"])
+        self.assert_no_child_run()
+
+    def test_unmerged_revision_rejects_stale_parent_draft_pr_head(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        stale_head = self.git("rev-parse", "origin/main").stdout.strip()
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            300,
+            parent_state["publication_branch"],
+            stale_head,
+        )
+
+        code, payload, _ = self.start_revision()
+
+        self.assertEqual(1, code)
+        self.assertEqual(
+            "parent-publication-identity-mismatch", payload["error"]["code"]
+        )
+        self.assert_no_child_run()
+
+    def test_unmerged_revision_requires_recorded_publication_branch(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        parent_state["publication_branch"] = None
+        self.write_state_for(self.PARENT_ISSUE, parent_state)
+
+        code, payload, _ = self.start_revision()
+
+        self.assertEqual(1, code)
+        self.assertEqual("invalid-publication-head", payload["error"]["code"])
+        self.assert_no_child_run()
+
+    def test_unmerged_revision_requires_completed_parent_status(self):
+        """An unmerged parent stalled before completion keeps the old invariant."""
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        parent_state["status"] = "DRAFT_PR_CREATION"
+        self.write_state_for(self.PARENT_ISSUE, parent_state)
+
+        code, payload, _ = self.start_revision()
+
+        self.assertEqual(1, code)
+        self.assertEqual("unmerged-parent-not-completed", payload["error"]["code"])
+        self.assert_no_child_run()
+
+    def test_unmerged_revision_requires_unadvanced_target(self):
+        """An advanced target is reconciliation territory, not a silent re-anchor."""
+        self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        self.git("checkout", "-q", "--detach", "origin/main")
+        (self.root / "unrelated.md").write_text("unrelated\n", encoding="utf-8")
+        self.git("add", "unrelated.md")
+        self.git("commit", "-qm", "unrelated target advance")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git("checkout", "-q", "workflow-branch")
+
+        code, payload, _ = self.start_revision()
+
+        self.assertEqual(1, code)
+        self.assertEqual("revision-target-advanced", payload["error"]["code"])
+        self.assert_no_child_run()
+
+    def test_merged_parent_revision_still_requires_target_head(self):
+        """The merged-parent invariant is unchanged by the anchored path."""
+        self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        implementation_commit = self.state_for(self.PARENT_ISSUE)[
+            "implementation_commit"
+        ]
+        self.advance_main_past(self.PARENT_ISSUE)
+        (self.root / "docs" / "example.md").write_text(
+            "# Example\n\nlater merged work\n", encoding="utf-8"
+        )
+        self.git("add", "docs/example.md")
+        self.git("commit", "-qm", "later work on top of the merged target")
+
+        code, payload, _ = self.start_revision()
+
+        self.assertEqual(1, code)
+        self.assertEqual("workflow-start-not-at-target", payload["error"]["code"])
+        self.assert_no_child_run()
+
+        self.git("reset", "-q", "--hard", implementation_commit)
+        code, payload, _ = self.start_revision()
+
+        self.assertEqual(0, code)
+        child_state = self.state_for(self.CHILD_ISSUE)
+        self.assertEqual(child_state["target_head"], child_state["test_commit"])
+        self.assertNotIn("publication_anchor", child_state["parent_run"])
+
+    def test_unmerged_revision_detects_inherited_test_content_drift(self):
+        """The inherited test boundary is verified against real Git content."""
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        self.git("checkout", "-q", "--detach", "origin/main")
+        (self.root / "src" / "test").mkdir(parents=True, exist_ok=True)
+        (self.root / "src" / "test" / "ExampleTest.kt").write_text(
+            "divergent approved test content\n", encoding="utf-8"
+        )
+        self.git("add", "src/test/ExampleTest.kt")
+        self.git("commit", "-qm", "divergent approved test boundary")
+        divergent_test_commit = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("checkout", "-q", parent_state["publication_branch"])
+        parent_state["test_commit"] = divergent_test_commit
+        self.write_state_for(self.PARENT_ISSUE, parent_state)
+
+        code, payload, _ = self.start_revision()
+
+        self.assertEqual(1, code)
+        self.assertEqual("inherited-test-content-drift", payload["error"]["code"])
+        self.assert_no_child_run()
+
+    def test_anchored_revision_reaches_approved_implementation(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        implementation_commit = parent_state["implementation_commit"]
+        target_head = self.git("rev-parse", "origin/main").stdout.strip()
+        self.assertEqual(0, self.start_revision()[0])
+
+        source = self.root / "src" / "main"
+        source.mkdir(parents=True, exist_ok=True)
+        (source / "Example.kt").write_text("fun revised() = 1\n", encoding="utf-8")
+        test_commit = self.state_for(self.CHILD_ISSUE)["test_commit"]
+        self.assertEqual(implementation_commit, test_commit)
+        evidence = {
+            "test_command": "%s -c \"print('tests ok')\"" % sys.executable,
+            "test_scope": ["src/test/ExampleTest.kt"],
+            "exit_code": 0,
+            "result": "PASS",
+            "test_commit": test_commit,
+            "candidate_diff": self.git_candidate_diff(test_commit),
+            "commit_subject": "Revise example implementation for issue #%s"
+            % self.CHILD_ISSUE,
+            "stdout": "tests ok\n",
+            "stderr": "",
+        }
+        self.write_artifact("child-evidence.json", json.dumps(evidence, indent=2))
+        self.write_artifact("child-impl-report.md", "child implementation")
+        self.write_artifact("child-impl-review.md", "child implementation review")
+        self.assertEqual(
+            0,
+            self.run_cli(
+                "submit-implementation",
+                str(self.CHILD_ISSUE),
+                "--artifact",
+                "artifacts-src/child-impl-report.md",
+                "--agent",
+                "chess-echo-implementer",
+                "--evidence",
+                "artifacts-src/child-evidence.json",
+            )[0],
+        )
+        self.assertEqual(
+            0,
+            self.run_cli(
+                "run-validation", str(self.CHILD_ISSUE), "--profile", "workflow-tooling"
+            )[0],
+        )
+        self.assertEqual(
+            0,
+            self.run_cli(
+                "review-implementation",
+                str(self.CHILD_ISSUE),
+                "--status",
+                workflow.READY,
+                "--artifact",
+                "artifacts-src/child-impl-review.md",
+                "--reviewer",
+                "chess-echo-reviewer",
+            )[0],
+        )
+        code, payload, _ = self.run_cli(
+            "approve-implementation",
+            str(self.CHILD_ISSUE),
+            "--by",
+            "owner",
+            "--confirm",
+            "implementation_approved",
+        )
+
+        self.assertEqual(0, code)
+        revised = payload["implementation_commit"]
+        self.assertEqual("DRAFT_PR_CREATION", self.state_for(self.CHILD_ISSUE)["status"])
+        self.assertEqual(
+            target_head, self.git("rev-parse", "%s^" % revised).stdout.strip()
+        )
+        final_names = sorted(
+            line.strip()
+            for line in self.git(
+                "diff", "--name-only", "%s..%s" % (target_head, revised)
+            ).stdout.splitlines()
+            if line.strip()
+        )
+        self.assertEqual(
+            [
+                "docs/example.md",
+                "src/main/Example.kt",
+                "src/test/ExampleTest.kt",
+            ],
+            final_names,
+        )
+        # The completed parent run is still intact and still WORKFLOW_COMPLETED.
+        self.assertEqual(
+            "WORKFLOW_COMPLETED", self.state_for(self.PARENT_ISSUE)["status"]
+        )
+        self.assertEqual(
+            implementation_commit,
+            self.state_for(self.PARENT_ISSUE)["implementation_commit"],
+        )
+
+
 class HistoricalLegacyPrReconciliationCrashSafetyTest(AgentWorkflowTest):
     """Regression tests for issue #399: crash-safe post-push observation and
     recovery for `reconcile-historical-legacy-draft-pr`.
