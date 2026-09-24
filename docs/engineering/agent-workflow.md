@@ -61,6 +61,37 @@ or digest. It also records the approved target and direct parent, test boundary
 and applicability, scope, validation/evidence, review readiness, approvals,
 artifacts, and reviewed subject.
 
+### Completed-run evidence integrity
+
+Completed-run reconciliation preserves the existing self-attested Gate 3
+authorization model; it does not authenticate the asserted operator or add a
+remote signing, tag, Ruleset, keyring, or attestation authority. Its narrower
+integrity check selects the completed implementation from the current
+checkout and the already-recorded live draft PR topology before it reads the
+mutable implementation journal. The PR must still be open and draft with the
+recorded repository, base, branch, and a head SHA equal to the checkout.
+
+At Gate 3 the controller canonicalizes pre-commit approval evidence (candidate
+identity/tree, approved test boundary, scope, artifacts, validation, and
+review state) as sorted compact JSON. It records the projection SHA-256 and
+byte length in the final journal and writes the digest once as
+`Gate-3-Evidence-SHA256` in the authoritative implementation commit message.
+Reconciliation recomputes the projection and requires that trailer before
+trusting candidate or test metadata. This detects mutable journal/state
+substitution within the existing remote and checkout trust boundary; it does
+not establish independent approval authority.
+
+Before replay, reconciliation compares explicit `--no-renames` boundaries for
+the approved candidate (`old target -> implementation`) and target evolution
+(`old target -> new target`). A same-hunk change, including one that produces
+the candidate's final text, is routed through the established implementation
+revision path; a separate hunk in the same file may proceed. Additions,
+deletions, mode/type changes, and symlinks are whole-path boundaries and fail
+with `approved-candidate-target-overlap`. Rename-form evidence fails closed
+with `unsupported-rename-boundary`. Actual replay is compared with a separately
+constructed reference tree and never supplies authority for its own expected
+result.
+
 The Gate 2 journal records the same class of evidence for the test-approval
 transition: the exact acknowledgment, the target and candidate test commit
 (also the expected direct parent of the authoritative commit), approved

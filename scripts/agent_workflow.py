@@ -978,6 +978,49 @@ def _git_candidate_tree(root, config, base_revision, context):
     return tree_id
 
 
+def _git_commit_candidate_tree(root, config, revision, paths, context):
+    """Compute the candidate-only tree represented by immutable commit entries."""
+    limits = _effective_limits(config, "git")
+    with tempfile.TemporaryDirectory() as scratch:
+        env = dict(os.environ)
+        env["GIT_INDEX_FILE"] = str(pathlib.Path(scratch) / "candidate-tree-index")
+        cacheinfo_args = []
+        for path in sorted(paths):
+            entry = _git_tree_entry(root, config, revision, path)
+            if entry is None:
+                continue
+            mode, object_type, blob_sha = entry.split()
+            _ensure(
+                object_type == "blob",
+                "implementation-candidate-mismatch",
+                "%s candidate path is not a blob: %s" % (context, path),
+            )
+            cacheinfo_args.extend(["--cacheinfo", "%s,%s,%s" % (mode, blob_sha, path)])
+        if cacheinfo_args:
+            _run_checked(
+                _git_command(config, "update-index", "--add", *cacheinfo_args),
+                limits,
+                root,
+                "git-update-index-failed",
+                "%s unable to construct committed candidate tree" % context,
+                env=env,
+            )
+        tree_id = _run_checked(
+            _git_command(config, "write-tree"),
+            limits,
+            root,
+            "git-write-tree-failed",
+            "%s unable to compute committed candidate tree" % context,
+            env=env,
+        )["stdout_text"].strip()
+    _ensure(
+        bool(re.fullmatch(r"[0-9a-f]{40}", tree_id)),
+        "git-write-tree-failed",
+        "%s produced an invalid committed candidate tree id" % context,
+    )
+    return tree_id
+
+
 def _git_commit_count(root, config, base, head, context):
     """Return the number of commits in the candidate range from base to head."""
     completed = _run_checked(
@@ -3024,7 +3067,7 @@ def _build_implementation_transition_journal(root, config, state, acknowledgment
         "validation-missing",
         "implementation approval requires successful validation evidence",
     )
-    return {
+    journal = {
         "format": TRANSITION_JOURNAL_FORMAT,
         "version": 1,
         "transition_id": uuid.uuid4().hex,
@@ -3061,6 +3104,102 @@ def _build_implementation_transition_journal(root, config, state, acknowledgment
         "authoritative_commit": None,
         "implementation_commit": None,
     }
+    projection = _implementation_evidence_projection(journal)
+    journal["gate3_evidence"] = {
+        "sha256": hashlib.sha256(projection).hexdigest(),
+        "byte_length": len(projection),
+    }
+    return journal
+
+
+GATE3_EVIDENCE_TRAILER = "Gate-3-Evidence-SHA256"
+
+
+def _implementation_evidence_projection(journal):
+    """Canonicalize only pre-commit Gate 3 evidence for commit-bound integrity."""
+    fields = (
+        "format",
+        "version",
+        "issue",
+        "operation",
+        "acknowledgment",
+        "implementation_candidate",
+        "candidate_identity",
+        "candidate_acceptance",
+        "reviewed_commit_subject",
+        "target_base",
+        "target_head",
+        "publication_branch",
+        "expected_parent",
+        "test_commit",
+        "approved_scope",
+        "test_implementation_status",
+        "test_implementation_reason",
+        "approved_test_boundary",
+        "approvals",
+        "artifacts",
+        "validation",
+        "evidence",
+        "implementation_review_ready",
+    )
+    projection = {"version": 1}
+    for field in fields:
+        projection[field] = journal.get(field)
+    candidate = projection.get("implementation_candidate")
+    if isinstance(candidate, dict) and isinstance(candidate.get("candidate_diff"), str):
+        candidate = dict(candidate)
+        candidate["candidate_diff"] = _canonical_candidate_diff(
+            candidate["candidate_diff"]
+        )
+        projection["implementation_candidate"] = candidate
+    return json.dumps(
+        projection, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+
+
+def _validate_implementation_evidence(root, config, journal, implementation_commit, context):
+    """Require the selected commit to bind the journal's pre-commit evidence."""
+    evidence = journal.get("gate3_evidence")
+    _ensure(
+        isinstance(evidence, dict)
+        and isinstance(evidence.get("sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", evidence["sha256"])
+        and isinstance(evidence.get("byte_length"), int)
+        and evidence["byte_length"] >= 0,
+        "implementation-approval-evidence-mismatch",
+        "%s implementation journal lacks a valid Gate 3 evidence identity" % context,
+    )
+    projection = _implementation_evidence_projection(journal)
+    _ensure(
+        evidence["sha256"] == hashlib.sha256(projection).hexdigest()
+        and evidence["byte_length"] == len(projection),
+        "implementation-approval-evidence-mismatch",
+        "%s implementation journal evidence projection does not match its identity" % context,
+    )
+    _require_gate3_evidence_trailer(
+        root, config, implementation_commit, evidence["sha256"], context
+    )
+
+
+def _require_gate3_evidence_trailer(root, config, implementation_commit, digest, context):
+    """Require one exact Gate 3 evidence trailer on a bound commit."""
+    body = _run_checked(
+        _git_command(config, "show", "-s", "--format=%B", implementation_commit),
+        _effective_limits(config, "git"),
+        root,
+        "git-commit-message-failed",
+        "%s could not read the implementation commit message" % context,
+    )["stdout_text"]
+    trailers = re.findall(
+        r"(?m)^%s:\s*([0-9a-f]{64})\s*$" % re.escape(GATE3_EVIDENCE_TRAILER),
+        body,
+    )
+    _ensure(
+        len(trailers) == 1 and trailers[0] == digest,
+        "implementation-approval-evidence-mismatch",
+        "%s implementation commit does not bind the finalized Gate 3 evidence"
+        % context,
+    )
 
 
 def _validate_journal_acknowledgment(config, acknowledgment, gate, error_code):
@@ -3301,6 +3440,9 @@ def _verify_authoritative_implementation(
         subject == reviewed_subject,
         "implementation-commit-subject-mismatch",
         "%s authoritative subject differs from reviewed subject" % context,
+    )
+    _validate_implementation_evidence(
+        root, config, journal, authoritative_head, context
     )
 
     candidate = journal["implementation_candidate"]
@@ -3609,8 +3751,12 @@ def command_recover_implementation_approval(args, root, config):
             _git_command(
                 config,
                 "commit",
-                "-qm",
+                "-q",
+                "-m",
                 journal["reviewed_commit_subject"],
+                "-m",
+                "%s: %s"
+                % (GATE3_EVIDENCE_TRAILER, journal["gate3_evidence"]["sha256"]),
             ),
             _effective_limits(config, "git"),
             root,
@@ -3659,6 +3805,151 @@ def _git_tree_entry(root, config, revision, path):
         return None
     # "<mode> <type> <sha>\t<path>" -> keep only the object-identifying prefix.
     return line[0].split("\t", 1)[0].strip()
+
+
+def _git_boundary(root, config, base, head, paths, context):
+    """Return explicit no-rename change boundaries keyed by path."""
+    command = _git_command(
+        config, "diff", "--no-renames", "--binary", "--unified=0", base, head, "--"
+    )
+    if paths:
+        command.extend(paths)
+    text = _run_checked(
+        command,
+        _effective_limits(config, "git"),
+        root,
+        "git-diff-failed",
+        "%s could not derive a Git change boundary" % context,
+    )["stdout_text"]
+    boundaries = {}
+    current_path = None
+    for section in re.split(r"(?m)(?=^diff --git )", text):
+        if not section:
+            continue
+        header = section.splitlines()[0]
+        parts = shlex.split(header.removeprefix("diff --git "))
+        _ensure(
+            len(parts) == 2 and parts[0].startswith("a/") and parts[1].startswith("b/"),
+            "invalid-candidate-boundary",
+            "%s contains an invalid diff header" % context,
+        )
+        current_path = parts[1][2:]
+        old_path = parts[0][2:]
+        _ensure(
+            current_path == old_path,
+            "unsupported-rename-boundary",
+            "%s contains rename-form evidence" % context,
+        )
+        whole_path = (
+            "new file mode " in section
+            or "deleted file mode " in section
+            or re.search(r"(?m)^old mode |^new mode |^similarity index |^rename ", section)
+            or "GIT binary patch" in section
+            or _git_tree_entry(root, config, base, current_path) is None
+            or _git_tree_entry(root, config, head, current_path) is None
+        )
+        entry_before = _git_tree_entry(root, config, base, current_path)
+        entry_after = _git_tree_entry(root, config, head, current_path)
+        if entry_before and entry_after and entry_before.split()[:2] != entry_after.split()[:2]:
+            whole_path = True
+        spans = []
+        for match in re.finditer(
+            r"(?m)^@@ -(?P<start>\d+)(?:,(?P<count>\d+))? \+\d+(?:,\d+)? @@",
+            section,
+        ):
+            start = int(match.group("start"))
+            count = int(match.group("count") or "1")
+            spans.append((start, start + count, count == 0))
+        boundaries[current_path] = {"whole_path": bool(whole_path), "spans": spans}
+
+    # A no-renames delete/add pair with identical content is still rename-form
+    # evidence and must not be interpreted by an ambient Git heuristic.
+    deleted = [
+        path for path, boundary in boundaries.items()
+        if _git_tree_entry(root, config, base, path) is not None
+        and _git_tree_entry(root, config, head, path) is None
+    ]
+    added = [
+        path for path, boundary in boundaries.items()
+        if _git_tree_entry(root, config, base, path) is None
+        and _git_tree_entry(root, config, head, path) is not None
+    ]
+    for source in deleted:
+        source_entry = _git_tree_entry(root, config, base, source)
+        for destination in added:
+            if source_entry == _git_tree_entry(root, config, head, destination):
+                _raise(
+                    "unsupported-rename-boundary",
+                    "%s contains an unsupported delete/add rename boundary" % context,
+                )
+    return boundaries
+
+
+def _boundaries_overlap(candidate, target):
+    if candidate["whole_path"] or target["whole_path"]:
+        return True
+    for candidate_start, candidate_end, candidate_insertion in candidate["spans"]:
+        for target_start, target_end, target_insertion in target["spans"]:
+            if candidate_insertion and target_insertion:
+                if candidate_start == target_start:
+                    return True
+            elif candidate_insertion:
+                if target_start <= candidate_start <= target_end:
+                    return True
+            elif target_insertion:
+                if candidate_start <= target_start <= candidate_end:
+                    return True
+            elif max(candidate_start, target_start) < min(candidate_end, target_end):
+                return True
+    return False
+
+
+def _completed_run_boundary_overlap_paths(root, config, source, new_target, context):
+    paths = source["implementation_candidate"]["candidate_paths"]
+    candidate = _git_boundary(
+        root, config, source["target_head"], source["implementation_commit"], paths, context
+    )
+    target = _git_boundary(root, config, source["target_head"], new_target, None, context)
+    status = _run_checked(
+        _git_command(
+            config,
+            "diff",
+            "--no-renames",
+            "--name-status",
+            source["target_head"],
+            new_target,
+        ),
+        _effective_limits(config, "git"),
+        root,
+        "git-diff-failed",
+        "%s could not inspect target evolution paths" % context,
+    )["stdout_text"].splitlines()
+    deleted_or_changed = {
+        parts[1]
+        for line in status
+        if (parts := line.split("\t", 1))[0] in {"D", "M"} and len(parts) == 2
+    }
+    added = {
+        parts[1]
+        for line in status
+        if (parts := line.split("\t", 1))[0] == "A" and len(parts) == 2
+    }
+    if added and deleted_or_changed.intersection(paths):
+        _raise(
+            "unsupported-rename-boundary",
+            "%s contains an unsupported delete/add rename boundary" % context,
+        )
+    overlaps = []
+    for path in sorted(set(candidate).intersection(target)):
+        if _boundaries_overlap(candidate[path], target[path]):
+            _ensure(
+                candidate[path]["whole_path"] or not target[path]["whole_path"],
+                "approved-candidate-target-overlap",
+                "%s target evolution changes an approved whole-path boundary at %s"
+                % (context, path),
+            )
+            overlaps.append(path)
+    return overlaps
 
 
 def _git_unmerged_paths(root, config):
@@ -3767,6 +4058,10 @@ def _verify_interrupted_candidate_commit(root, config, state, impl_journal, cand
         "implementation-candidate-mismatch",
         "%s interrupted candidate identity differs from the journal" % context,
     )
+    if _implementation_journal_has_modern_evidence(impl_journal):
+        _validate_implementation_evidence(
+            root, config, impl_journal, candidate_commit, context
+        )
     approved_test_diff = (
         _git_diff_text(root, config, old_target, test_commit, test_paths)
         if test_paths
@@ -3781,6 +4076,21 @@ def _verify_interrupted_candidate_commit(root, config, state, impl_journal, cand
         approved_test_diff == interrupted_test_diff,
         "approved-test-boundary-mismatch",
         "%s interrupted candidate changed the approved test boundary" % context,
+    )
+
+
+def _implementation_journal_has_modern_evidence(journal):
+    """Distinguish legacy raw-diff identities from current canonical evidence."""
+    candidate = journal.get("implementation_candidate") or {}
+    return (
+        journal.get("gate3_evidence") is not None
+        and isinstance(candidate.get("candidate_diff"), str)
+        and journal.get("candidate_identity")
+        == _candidate_identity(
+            journal.get("test_commit"),
+            candidate["candidate_diff"],
+            candidate.get("candidate_paths") or [],
+        )
     )
 
 
@@ -3830,6 +4140,11 @@ def _build_reconciliation_journal(
         "source_authoritative_commit": impl_journal.get("authoritative_commit"),
         "source_implementation_commit": impl_journal.get("implementation_commit"),
         "source_acknowledgment": impl_journal["acknowledgment"],
+        "gate3_evidence": (
+            impl_journal.get("gate3_evidence")
+            if _implementation_journal_has_modern_evidence(impl_journal)
+            else None
+        ),
         "candidate_identity": impl_journal["candidate_identity"],
         "implementation_candidate": impl_journal["implementation_candidate"],
         "reviewed_commit_subject": impl_journal["reviewed_commit_subject"],
@@ -3967,7 +4282,12 @@ def _materialize_reconciliation(root, config, state, recon, candidate_commit, ne
             _effective_limits(config, "git"),
             root,
         )
-        commit_args = ["commit", "-qm", subject]
+        commit_args = ["commit", "-q", "-m", subject]
+        evidence = recon.get("gate3_evidence") or {}
+        if evidence.get("sha256"):
+            commit_args.extend(
+                ["-m", "%s: %s" % (GATE3_EVIDENCE_TRAILER, evidence["sha256"])]
+            )
         if staged["result"].get("exit_code") == 0:
             commit_args.append("--allow-empty")
         _run_checked(
@@ -4021,7 +4341,6 @@ def _verify_reconciled_implementation(root, config, state, recon, reconciled, co
         "implementation-commit-subject-mismatch",
         "%s reconciled subject differs from the reviewed subject" % context,
     )
-
     final_names = _git_diff_names(root, config, "%s..%s" % (new_target, reconciled))
     approved_paths = set(test_paths).union(candidate_paths)
     if require_exact_scope:
@@ -4038,6 +4357,11 @@ def _verify_reconciled_implementation(root, config, state, recon, reconciled, co
         )
     _require_candidate_scope(final_names, scope, context)
     _require_production_only(candidate_paths, scope, context)
+    evidence = recon.get("gate3_evidence") or {}
+    if evidence.get("sha256"):
+        _require_gate3_evidence_trailer(
+            root, config, reconciled, evidence["sha256"], context
+        )
 
     # Content/tree/mode equivalence (#282): the reconciled tree must carry exactly
     # the interrupted candidate's approved test boundary and production content.
@@ -6654,7 +6978,16 @@ def command_approve_implementation(args, root, config):
         "unable to soft-reset to target_head",
     )
     _run_checked(
-        _git_command(config, "commit", "-qm", current_candidate["commit_subject"]),
+        _git_command(
+            config,
+            "commit",
+            "-q",
+            "-m",
+            current_candidate["commit_subject"],
+            "-m",
+            "%s: %s"
+            % (GATE3_EVIDENCE_TRAILER, journal["gate3_evidence"]["sha256"]),
+        ),
         _effective_limits(config, "git"),
         root,
         "git-commit-failed",
@@ -8691,79 +9024,167 @@ def _completed_run_reconciliation_source(root, config, state, context):
         "%s requires status in %s (current: %s)"
         % (context, list(REVISION_PARENT_ELIGIBLE_STATUSES), state["status"]),
     )
-    implementation_commit = state.get("implementation_commit")
-    _ensure(
-        implementation_commit,
-        "parent-run-missing-implementation-commit",
-        "%s requires a recorded authoritative implementation commit" % context,
-    )
-    validation = state.get("validation") or {}
-    _ensure(
-        isinstance(validation, dict)
-        and validation.get("passed") is True
-        and isinstance(validation.get("profile"), str)
-        and validation.get("profile"),
-        "validation-missing",
-        "%s requires a previously passing recorded validation profile" % context,
-    )
     draft_pr = _recorded_draft_pr_identity(
         state.get("draft_pr"),
         config,
         context,
         "completed-run-missing-pr-identity",
     )
-    old_target = _state_target_head(state)
+    implementation_commit = _current_head(root, config)
+    journal = _read_json(
+        _implementation_transition_journal_path(root, config, state["issue"]),
+        "implementation approval transition journal",
+    )
+    _ensure(
+        journal.get("format") == TRANSITION_JOURNAL_FORMAT
+        and journal.get("version") == 1
+        and journal.get("issue") == state["issue"]
+        and journal.get("operation") == "approve-implementation"
+        and journal.get("status") == "finalized"
+        and journal.get("implementation_commit") == implementation_commit
+        and journal.get("authoritative_commit") == implementation_commit,
+        "invalid-implementation-approval-journal",
+        "%s requires finalized Gate 3 evidence for the live implementation commit"
+        % context,
+    )
+    old_target = journal.get("target_head")
+    _ensure(
+        isinstance(old_target, str) and old_target,
+        "invalid-implementation-approval-journal",
+        "%s implementation journal has no target head" % context,
+    )
     _require_direct_child(root, config, old_target, implementation_commit, context)
     _require_single_commit(root, config, old_target, implementation_commit, context)
-    test_paths = _approved_test_paths(root, config, state, context)
-    approved_boundary = _journal_test_boundary(root, config, state)
+    approved_boundary = journal.get("approved_test_boundary")
+    _ensure(
+        isinstance(approved_boundary, dict)
+        and approved_boundary.get("target_head") == old_target
+        and approved_boundary.get("test_commit") == journal.get("test_commit")
+        and isinstance(approved_boundary.get("paths"), list)
+        and isinstance(approved_boundary.get("diff_sha256"), str)
+        and isinstance(approved_boundary.get("diff_bytes"), int),
+        "approved-test-boundary-mismatch",
+        "%s implementation journal has an invalid approved test boundary" % context,
+    )
+    test_paths = approved_boundary["paths"]
+    test_commit = journal["test_commit"]
+    approved_test_patch = (
+        _git_diff_text(root, config, old_target, test_commit, test_paths)
+        if test_paths
+        else ""
+    )
+    digest, byte_length = _text_digest(approved_test_patch)
+    _ensure(
+        digest == approved_boundary["diff_sha256"],
+        "approved-test-boundary-mismatch",
+        "%s reconstructed test boundary differs from Gate 3 evidence" % context,
+    )
+    _validate_implementation_evidence(
+        root, config, journal, implementation_commit, context
+    )
+    _ensure(
+        byte_length == approved_boundary["diff_bytes"],
+        "approved-test-boundary-mismatch",
+        "%s reconstructed test boundary differs from Gate 3 evidence" % context,
+    )
     final_names = _git_diff_names(
         root, config, "%s..%s" % (old_target, implementation_commit)
     )
-    candidate_paths = sorted(path for path in final_names if path not in test_paths)
+    candidate = journal.get("implementation_candidate")
+    _ensure(
+        isinstance(candidate, dict)
+        and isinstance(candidate.get("candidate_paths"), list)
+        and isinstance(candidate.get("candidate_diff"), str),
+        "implementation-candidate-mismatch",
+        "%s implementation journal has an invalid candidate" % context,
+    )
+    candidate_paths = sorted(candidate["candidate_paths"])
     expected_names = sorted(set(test_paths).union(candidate_paths))
     _ensure(
         final_names == expected_names,
         "implementation-scope-drift",
         "%s authoritative paths differ from the approved boundary" % context,
     )
-    scope = state.get("approved_scope") or []
+    scope = journal.get("approved_scope") or []
     _require_production_only(candidate_paths, scope, context)
     candidate_diff = _git_diff_text(
-        root, config, state["test_commit"], implementation_commit, candidate_paths
+        root, config, test_commit, implementation_commit, candidate_paths
+    )
+    _ensure(
+        _canonical_candidate_diff(candidate_diff)
+        == _canonical_candidate_diff(candidate["candidate_diff"])
+        and _candidate_identity_matches(
+            journal.get("candidate_identity"), test_commit, candidate_diff, candidate_paths
+        )
+        and candidate.get("candidate_tree")
+        == _git_commit_candidate_tree(
+            root, config, implementation_commit, candidate_paths, context
+        ),
+        "implementation-candidate-mismatch",
+        "%s immutable implementation content differs from Gate 3 evidence" % context,
+    )
+    validation = journal.get("validation") or {}
+    _ensure(
+        isinstance(validation, dict)
+        and validation.get("passed") is True
+        and isinstance(validation.get("profile"), str)
+        and validation.get("profile"),
+        "validation-missing",
+        "%s requires previously passing Gate 3 validation evidence" % context,
+    )
+    _ensure(
+        state.get("implementation_commit") == implementation_commit
+        and state.get("test_commit") == test_commit
+        and state.get("approved_scope") == scope,
+        "implementation-approval-journal-mismatch",
+        "%s mutable run state disagrees with verified Gate 3 evidence" % context,
+    )
+    _ensure(
+        state.get("implementation_candidate") == candidate,
+        "implementation-candidate-mismatch",
+        "%s mutable candidate state disagrees with immutable implementation evidence"
+        % context,
     )
     return {
         "issue": state["issue"],
         "source_status": state["status"],
-        "target_base": state.get("target_base"),
+        "target_base": journal.get("target_base"),
         "target_head": old_target,
-        "test_commit": state.get("test_commit"),
+        "test_commit": test_commit,
         "approved_scope": scope,
         "approved_test_boundary": approved_boundary,
-        "approved_test_patch": (
-            _git_diff_text(
-                root,
-                config,
-                old_target,
-                state["test_commit"],
-                test_paths,
-            )
-            if test_paths
-            else ""
-        ),
+        "approved_test_patch": approved_test_patch,
         "implementation_commit": implementation_commit,
-        "implementation_candidate": {
-            "test_commit": state["test_commit"],
-            "candidate_diff": candidate_diff,
-            "candidate_paths": candidate_paths,
-        },
-        "candidate_identity": _candidate_identity(
-            state["test_commit"], candidate_diff, candidate_paths
-        ),
-        "reviewed_commit_subject": _git_commit_subject(root, config, implementation_commit),
+        "implementation_candidate": candidate,
+        "candidate_identity": journal["candidate_identity"],
+        "reviewed_commit_subject": journal["reviewed_commit_subject"],
         "validation_profile": validation["profile"],
         "draft_pr": draft_pr,
     }
+
+
+def _require_completed_run_live_anchor(root, config, source, context):
+    """Bind a clean replay to the existing live draft PR before publication."""
+    draft_pr = source["draft_pr"]
+    live = _lookup_pr_identity(
+        root, config, str(draft_pr["number"]), repository=draft_pr["repository"]
+    )
+    _require_pr_revision_identity(
+        live,
+        _pr_revision_expected_identity(
+            draft_pr["number"],
+            draft_pr["repository"],
+            config["target_base"],
+            draft_pr["head_ref_name"],
+        ),
+        context,
+    )
+    _ensure(
+        live.get("headRefOid") == source["implementation_commit"],
+        "implementation-approval-anchor-mismatch",
+        "%s requires the live draft PR head to match the completed-run checkout"
+        % context,
+    )
 
 
 def _validate_completed_run_reconciliation_journal(
@@ -9003,16 +9424,55 @@ def _verify_completed_run_reconciled_commit(
         )
         _require_candidate_scope(final_names, source["approved_scope"], context)
         _require_production_only(candidate_paths, source["approved_scope"], context)
-        for path in expected_names:
-            _ensure(
-                _git_tree_entry(scratch_root, config, reconciled, path)
-                == _git_tree_entry(
-                    repo_root, config, source["implementation_commit"], path
-                ),
-                "implementation-candidate-mismatch",
-                "%s reconciled content differs from the approved implementation at %s"
-                % (context, path),
+        reference_root = scratch_root.parent / (
+            "completed-run-reference-%s" % uuid.uuid4().hex
+        )
+        _create_scratch_worktree(repo_root, config, reference_root, new_target, context)
+        try:
+            test_attempt = _try_apply_reconciliation_patch(
+                reference_root, config, reference_root.parent, source["approved_test_patch"]
             )
+            _ensure(
+                test_attempt["applied"],
+                "approved-test-boundary-mismatch",
+                "%s could not build the independent approved test reference" % context,
+            )
+            candidate_attempt = _try_apply_reconciliation_patch(
+                reference_root,
+                config,
+                reference_root.parent,
+                source["implementation_candidate"]["candidate_diff"],
+            )
+            _ensure(
+                candidate_attempt["applied"],
+                "implementation-candidate-mismatch",
+                "%s could not build the independent candidate reference" % context,
+            )
+            reference_tree = _run_checked(
+                _git_command(config, "write-tree"),
+                _effective_limits(config, "git"),
+                reference_root,
+                "git-write-tree-failed",
+                "%s could not construct the independent reference tree" % context,
+            )["stdout_text"].strip()
+            for path in candidate_paths:
+                _ensure(
+                    _git_tree_entry(scratch_root, config, reconciled, path)
+                    == _git_tree_entry(reference_root, config, reference_tree, path),
+                    "implementation-candidate-mismatch",
+                    "%s reconciled candidate content differs from the independent reference at %s"
+                    % (context, path),
+                )
+            for path in test_paths:
+                _ensure(
+                    _git_tree_entry(scratch_root, config, reconciled, path)
+                    == _git_tree_entry(reference_root, config, reference_tree, path),
+                    "approved-test-boundary-mismatch",
+                    "%s reconciled test content differs from the independent reference at %s"
+                    % (context, path),
+                )
+        finally:
+            _cleanup_scratch_worktree(repo_root, config, reference_root)
 
 
 def _load_authoritative_validation_config(scratch_root, context):
@@ -9041,6 +9501,24 @@ def _load_authoritative_validation_config(scratch_root, context):
             "from the reconciliation target (%s: %s)"
             % (context, error.code, error.message),
         )
+
+
+def _require_authoritative_reconciliation_config(root, config, source, new_target, context):
+    """Preserve target configuration validation before boundary analysis."""
+    scratch = _completed_run_scratch_path(
+        root, config, source["issue"], uuid.uuid4().hex, "completed-run-config"
+    )
+    _create_scratch_worktree(root, config, scratch, new_target, context)
+    try:
+        authoritative_config = _load_authoritative_validation_config(scratch, context)
+        _ensure(
+            source["validation_profile"] in authoritative_config["validation_profiles"],
+            "unknown-profile",
+            "%s authoritative target configuration is missing validation profile %s"
+            % (context, source["validation_profile"]),
+        )
+    finally:
+        _cleanup_scratch_worktree(root, config, scratch)
 
 
 def _attempt_completed_run_reconciliation(root, config, source, new_target, transition_id):
@@ -9289,9 +9767,25 @@ def command_reconcile_completed_run(args, root, config):
             }
             _write_json(journal_path, journal)
 
-        attempt = _attempt_completed_run_reconciliation(
-            root, config, source, new_target, journal["transition_id"]
+        _require_authoritative_reconciliation_config(
+            root, config, source, new_target, context
         )
+        overlap_paths = _completed_run_boundary_overlap_paths(
+            root, config, source, new_target, context
+        )
+        if overlap_paths:
+            attempt = {
+                "replay_clean": False,
+                "validation_passed": False,
+                "setup_failed": False,
+                "conflict_paths": overlap_paths,
+                "setup": None,
+                "checks": None,
+            }
+        else:
+            attempt = _attempt_completed_run_reconciliation(
+                root, config, source, new_target, journal["transition_id"]
+            )
         journal["validation"] = attempt["checks"]
         journal["setup"] = attempt.get("setup")
         journal["conflict_paths"] = attempt["conflict_paths"]
@@ -9319,6 +9813,7 @@ def command_reconcile_completed_run(args, root, config):
 
         if required_revision is None:
             reconciled_commit = attempt["reconciled_commit"]
+            _require_completed_run_live_anchor(root, config, source, context)
             journal["status"] = "committed"
             journal["outcome"] = "reconciled"
             journal["target_drift"] = _target_drift_record(

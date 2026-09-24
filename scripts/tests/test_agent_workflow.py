@@ -2308,6 +2308,81 @@ class AgentWorkflowTest(unittest.TestCase):
         self.git("update-ref", "refs/remotes/origin/main", remote_head)
         return remote_head
 
+    def advance_remote_ref_with_entries(
+        self, base_commit, entries, name="authorized downstream remote merge"
+    ):
+        """Advance the target with explicit Git tree entry modes or deletions."""
+        index_path = self.root / "alt-index"
+        if index_path.exists():
+            index_path.unlink()
+        env = os.environ.copy()
+        env["GIT_INDEX_FILE"] = str(index_path)
+        try:
+            subprocess.run(
+                ["git", "read-tree", base_commit],
+                cwd=self.root,
+                check=True,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for path, entry in entries.items():
+                if entry is None:
+                    subprocess.run(
+                        ["git", "update-index", "--force-remove", "--", path],
+                        cwd=self.root,
+                        check=True,
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    continue
+                mode, content = entry
+                blob = subprocess.run(
+                    ["git", "hash-object", "-w", "--stdin"],
+                    cwd=self.root,
+                    check=True,
+                    env=env,
+                    input=content,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                ).stdout.strip()
+                subprocess.run(
+                    ["git", "update-index", "--add", "--cacheinfo", mode, blob, path],
+                    cwd=self.root,
+                    check=True,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            tree = subprocess.run(
+                ["git", "write-tree"],
+                cwd=self.root,
+                check=True,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+            remote_head = subprocess.run(
+                ["git", "commit-tree", tree, "-p", base_commit, "-m", name],
+                cwd=self.root,
+                check=True,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+        finally:
+            if index_path.exists():
+                index_path.unlink()
+        self.git("update-ref", "refs/remotes/origin/main", remote_head)
+        return remote_head
+
     def advance_remote_ref_from(self, parent_commit, changes, name="authorized downstream remote merge"):
         """Advance `origin/<target_base>` by committing `changes` directly onto `parent_commit`.
 
@@ -3974,7 +4049,9 @@ class AgentWorkflowTest(unittest.TestCase):
         code, payload, _ = self.reconcile_implementation_target()
 
         self.assertEqual(1, code)
-        self.assertEqual("approved-test-boundary-mismatch", payload["error"]["code"])
+        self.assertEqual(
+            "implementation-approval-evidence-mismatch", payload["error"]["code"]
+        )
         self.assertEqual(materialized_commit, self.git("rev-parse", "HEAD").stdout.strip())
         self.assertEqual(
             "WAITING_FOR_IMPLEMENTATION_HUMAN_APPROVAL", self.state()["status"]
@@ -7584,8 +7661,18 @@ class RevisionAndPrRevisionTest(AgentWorkflowTest):
             / "completed-run-reconciliation-transition.json"
         )
 
-    def bootstrap_completed_parent(self, issue, profile="workflow-tooling"):
+    def bootstrap_completed_parent(
+        self, issue, profile="workflow-tooling", existing_document=None
+    ):
         """Drive a small, real run through every gate to WORKFLOW_COMPLETED."""
+        if existing_document is not None:
+            (self.root / "docs").mkdir(parents=True, exist_ok=True)
+            (self.root / "docs" / "example.md").write_text(
+                existing_document, encoding="utf-8"
+            )
+            self.git("add", "docs/example.md")
+            self.git("commit", "-qm", "add existing example documentation")
+            self.git("update-ref", "refs/remotes/origin/main", "HEAD")
         self.write_artifact("parent-plan.md", "parent plan")
         self.write_artifact("parent-plan-review.md", "parent plan review")
         self.write_artifact("parent-test-report.md", "parent tests")
@@ -7651,9 +7738,16 @@ class RevisionAndPrRevisionTest(AgentWorkflowTest):
             self.run_cli("approve-tests", str(issue), "--by", "owner", "--confirm", "tests_approved")[0],
         )
         (self.root / "docs").mkdir(parents=True, exist_ok=True)
+        candidate_document = (
+            existing_document.replace(
+                "Candidate hunk anchor.",
+                "Candidate hunk approved.",
+            )
+            if existing_document is not None
+            else "# Example\n\n```mermaid\nflowchart LR\n    A --> B\n```\n"
+        )
         (self.root / "docs" / "example.md").write_text(
-            "# Example\n\n```mermaid\nflowchart LR\n    A --> B\n```\n",
-            encoding="utf-8",
+            candidate_document, encoding="utf-8"
         )
         test_commit = self.state_for(issue)["test_commit"]
         candidate_diff = self.git_candidate_diff(test_commit)
@@ -9156,6 +9250,576 @@ class RevisionAndPrRevisionTest(AgentWorkflowTest):
             scratch_root.exists() and any(scratch_root.iterdir()),
             "scratch reconciliation worktree must be cleaned up",
         )
+
+    def test_reconcile_completed_run_accepts_same_file_different_hunk_target_change(self):
+        initial_document = (
+            "# Example\n\n"
+            "Candidate hunk anchor.\n\n"
+            "Independent target hunk anchor.\n"
+        )
+        parent_state = self.bootstrap_completed_parent(
+            self.PARENT_ISSUE, existing_document=initial_document
+        )
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        new_target = self.advance_remote_ref_past_commit(
+            parent_state["target_head"],
+            {
+                "docs/example.md": (
+                    "# Example\n\nCandidate hunk anchor.\n\n"
+                    "Independent target hunk advanced.\n"
+                ),
+            },
+            name="authorized same-file downstream change",
+        )
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": parent_state["implementation_commit"],
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(0, code)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("WORKFLOW_COMPLETED", payload["status"])
+        after = self.state_for(self.PARENT_ISSUE)
+        reconciled_document = self.git(
+            "show", "%s:docs/example.md" % after["implementation_commit"]
+        ).stdout
+        self.assertIn("Candidate hunk approved.", reconciled_document)
+        self.assertIn("Independent target hunk advanced.", reconciled_document)
+
+    def test_reconcile_completed_run_starts_implementation_revision_for_same_hunk_target_change(self):
+        initial_document = (
+            "# Example\n\n"
+            "Candidate hunk anchor.\n\n"
+            "Independent target hunk anchor.\n"
+        )
+        parent_state = self.bootstrap_completed_parent(
+            self.PARENT_ISSUE, existing_document=initial_document
+        )
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        self.advance_remote_ref_past_commit(
+            parent_state["target_head"],
+            {
+                "docs/example.md": (
+                    "# Example\n\nCandidate hunk target change.\n\n"
+                    "Independent target hunk anchor.\n"
+                ),
+            },
+            name="overlapping downstream change",
+        )
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": parent_state["implementation_commit"],
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(0, code)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("implementation", payload["revision"]["class"])
+        revision_state = self.state_for(payload["revision"]["issue"])
+        self.assertEqual("IMPLEMENTATION", revision_state["status"])
+        self.assertEqual("implementation", revision_state["parent_run"]["class"])
+        self.assertFalse(self.git_push_calls)
+
+    def test_reconcile_completed_run_starts_implementation_revision_for_same_hunk_same_result_target_change(self):
+        initial_document = (
+            "# Example\n\n"
+            "Candidate hunk anchor.\n\n"
+            "Independent target hunk anchor.\n"
+        )
+        parent_state = self.bootstrap_completed_parent(
+            self.PARENT_ISSUE, existing_document=initial_document
+        )
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        self.advance_remote_ref_past_commit(
+            parent_state["target_head"],
+            {
+                "docs/example.md": (
+                    "# Example\n\nCandidate hunk approved.\n\n"
+                    "Independent target hunk anchor.\n"
+                ),
+            },
+            name="same-result overlapping downstream change",
+        )
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": parent_state["implementation_commit"],
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(0, code)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("implementation", payload["revision"]["class"])
+        revision_state = self.state_for(payload["revision"]["issue"])
+        self.assertEqual("IMPLEMENTATION", revision_state["status"])
+        self.assertEqual("implementation", revision_state["parent_run"]["class"])
+        self.assertFalse(self.git_push_calls)
+
+    def test_reconcile_completed_run_rejects_tampered_candidate_hunk(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        self.advance_remote_ref_past_commit(
+            parent_state["target_head"],
+            {
+                "unrelated.txt": "downstream unrelated change\n",
+            },
+            name="authorized downstream change",
+        )
+        state = self.state_for(self.PARENT_ISSUE)
+        state["implementation_candidate"]["candidate_diff"] = state["implementation_candidate"]["candidate_diff"].replace(
+            "flowchart LR",
+            "tampered candidate hunk",
+        )
+        self.write_state_for(self.PARENT_ISSUE, state)
+
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": parent_state["implementation_commit"],
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(1, code)
+        self.assertEqual("implementation-candidate-mismatch", payload["error"]["code"])
+
+    def test_reconcile_completed_run_rejects_test_boundary_digest_mismatch(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        self.advance_remote_ref_past_commit(
+            parent_state["target_head"],
+            {"unrelated.txt": "downstream unrelated change\n"},
+            name="authorized downstream change",
+        )
+        journal_path = (
+            self.root
+            / ".agent-workflow"
+            / "runs"
+            / ("issue-%s" % self.PARENT_ISSUE)
+            / "implementation-approval-transition.json"
+        )
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["approved_test_boundary"]["diff_sha256"] = "0" * 64
+        journal_path.write_text(json.dumps(journal, indent=2) + "\n", encoding="utf-8")
+
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": parent_state["implementation_commit"],
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(1, code)
+        self.assertEqual("approved-test-boundary-mismatch", payload["error"]["code"])
+
+    def test_reconcile_completed_run_rejects_test_boundary_byte_length_mismatch(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        self.advance_remote_ref_past_commit(
+            parent_state["target_head"],
+            {"unrelated.txt": "downstream unrelated change\n"},
+            name="authorized downstream change",
+        )
+        journal_path = (
+            self.root
+            / ".agent-workflow"
+            / "runs"
+            / ("issue-%s" % self.PARENT_ISSUE)
+            / "implementation-approval-transition.json"
+        )
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["approved_test_boundary"]["diff_bytes"] += 1
+        journal_path.write_text(json.dumps(journal, indent=2) + "\n", encoding="utf-8")
+
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": parent_state["implementation_commit"],
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(
+            "implementation-approval-evidence-mismatch",
+            payload.get("error", {}).get("code"),
+        )
+        self.assertEqual(1, code)
+
+    def test_reconcile_completed_run_rejects_coordinated_journal_state_tampering(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        self.advance_remote_ref_past_commit(
+            parent_state["target_head"],
+            {"unrelated.txt": "downstream unrelated change\n"},
+            name="authorized downstream change",
+        )
+        journal_path = (
+            self.root
+            / ".agent-workflow"
+            / "runs"
+            / ("issue-%s" % self.PARENT_ISSUE)
+            / "implementation-approval-transition.json"
+        )
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["implementation_commit"] = parent_state["target_head"]
+        journal["authoritative_commit"] = parent_state["target_head"]
+        journal_path.write_text(json.dumps(journal, indent=2) + "\n", encoding="utf-8")
+        state = self.state_for(self.PARENT_ISSUE)
+        state["implementation_commit"] = parent_state["target_head"]
+        self.write_state_for(self.PARENT_ISSUE, state)
+
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": parent_state["implementation_commit"],
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(
+            "invalid-implementation-approval-journal",
+            payload.get("error", {}).get("code"),
+        )
+        self.assertEqual(1, code)
+
+    def test_reconcile_completed_run_requires_commit_bound_evidence_digest(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        subject = self.git("show", "-s", "--format=%s", "HEAD").stdout.strip()
+        self.git("commit", "--amend", "-qm", subject)
+        unsigned_commit = self.git("rev-parse", "HEAD").stdout.strip()
+        journal_path = (
+            self.root
+            / ".agent-workflow"
+            / "runs"
+            / ("issue-%s" % self.PARENT_ISSUE)
+            / "implementation-approval-transition.json"
+        )
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["implementation_commit"] = unsigned_commit
+        journal["authoritative_commit"] = unsigned_commit
+        journal_path.write_text(json.dumps(journal, indent=2) + "\n", encoding="utf-8")
+        parent_state = self.state_for(self.PARENT_ISSUE)
+        parent_state["implementation_commit"] = unsigned_commit
+        self.write_state_for(self.PARENT_ISSUE, parent_state)
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=unsigned_commit,
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        self.advance_remote_ref_past_commit(
+            parent_state["target_head"],
+            {"unrelated.txt": "downstream unrelated change\n"},
+            name="authorized downstream change",
+        )
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": unsigned_commit,
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(1, code)
+        self.assertEqual(
+            "implementation-approval-evidence-mismatch",
+            payload.get("error", {}).get("code"),
+        )
+        self.assertFalse(self.git_push_calls)
+
+    def test_reconcile_completed_run_requires_live_pr_head_to_match_checkout(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        self.advance_remote_ref_past_commit(
+            parent_state["target_head"],
+            {"unrelated.txt": "downstream unrelated change\n"},
+            name="authorized downstream change",
+        )
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": parent_state["target_head"],
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(1, code)
+        self.assertEqual(
+            "implementation-approval-anchor-mismatch",
+            payload.get("error", {}).get("code"),
+        )
+        self.assertFalse(self.git_push_calls)
+
+    def test_reconcile_completed_run_rejects_mutated_evidence_projection(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        self.advance_remote_ref_past_commit(
+            parent_state["target_head"],
+            {"unrelated.txt": "downstream unrelated change\n"},
+            name="authorized downstream change",
+        )
+        journal_path = (
+            self.root
+            / ".agent-workflow"
+            / "runs"
+            / ("issue-%s" % self.PARENT_ISSUE)
+            / "implementation-approval-transition.json"
+        )
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["gate3_evidence"] = {"sha256": "0" * 64, "byte_length": 0}
+        journal_path.write_text(json.dumps(journal, indent=2) + "\n", encoding="utf-8")
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": parent_state["implementation_commit"],
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(1, code)
+        self.assertEqual(
+            "implementation-approval-evidence-mismatch",
+            payload.get("error", {}).get("code"),
+        )
+        self.assertFalse(self.git_push_calls)
+
+    def assert_reconcile_completed_run_rejects_whole_path_target_evolution(
+        self, entry, name
+    ):
+        initial_document = (
+            "# Example\n\n"
+            "Candidate hunk anchor.\n\n"
+            "Independent target hunk anchor.\n"
+        )
+        parent_state = self.bootstrap_completed_parent(
+            self.PARENT_ISSUE, existing_document=initial_document
+        )
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        self.advance_remote_ref_with_entries(
+            parent_state["target_head"],
+            {"docs/example.md": entry},
+            name="whole-path %s target change" % name,
+        )
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": parent_state["implementation_commit"],
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(1, code)
+        self.assertEqual(
+            "approved-candidate-target-overlap",
+            payload.get("error", {}).get("code"),
+        )
+        self.assertFalse(self.git_push_calls)
+
+    def test_reconcile_completed_run_rejects_deleted_candidate_path_target_evolution(self):
+        self.assert_reconcile_completed_run_rejects_whole_path_target_evolution(
+            None, "deletion"
+        )
+
+    def test_reconcile_completed_run_rejects_candidate_mode_target_evolution(self):
+        self.assert_reconcile_completed_run_rejects_whole_path_target_evolution(
+            (
+                "100755",
+                "# Example\n\nCandidate hunk anchor.\n\nIndependent target hunk anchor.\n",
+            ),
+            "mode",
+        )
+
+    def test_reconcile_completed_run_rejects_candidate_symlink_target_evolution(self):
+        self.assert_reconcile_completed_run_rejects_whole_path_target_evolution(
+            ("120000", "other-target"), "symlink"
+        )
+
+    def test_reconcile_completed_run_rejects_rename_form_target_evolution(self):
+        initial_document = (
+            "# Example\n\n"
+            "Candidate hunk anchor.\n\n"
+            "Independent target hunk anchor.\n"
+        )
+        parent_state = self.bootstrap_completed_parent(
+            self.PARENT_ISSUE, existing_document=initial_document
+        )
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        self.advance_remote_ref_with_entries(
+            parent_state["target_head"],
+            {
+                "docs/example.md": None,
+                "docs/renamed-example.md": ("100644", initial_document),
+            },
+            name="rename-form target change",
+        )
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": parent_state["implementation_commit"],
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(1, code)
+        self.assertEqual(
+            "unsupported-rename-boundary",
+            payload.get("error", {}).get("code"),
+        )
+        self.assertFalse(self.git_push_calls)
 
     def test_reconcile_completed_run_scratch_setup_provisions_dependency_and_reconciles(self):
         parent_state = self.bootstrap_completed_parent(
