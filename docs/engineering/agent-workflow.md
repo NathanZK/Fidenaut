@@ -1088,6 +1088,39 @@ local workflow only. It does not independently authenticate the asserted
 operator, and any mismatch between the journal, Git state, or live PR state
 fails closed instead of being repaired heuristically.
 
+#### Target re-anchoring on retry (`target_reanchors`)
+
+`reconcile-completed-run` resolves the authoritative target fresh on every
+invocation, so a pre-existing `pending` (or `committed`-but-not-yet-finalized)
+journal can be retried after the target has advanced again since the journal
+was first written. When that happens, the journal's own `new_target_head` is
+re-anchored in place to the freshly resolved target before any replay,
+overlap check, or finalization proceeds — otherwise a finalized journal could
+disagree with the target that Git state, provenance, and the actual replay
+all agree on.
+
+The journal records this as an append-only `target_reanchors` list, distinct
+from the unrelated `reanchors` list used by implementation-target
+reconciliation. Each entry binds a `reanchor_id`, the `from_new_target_head`
+and `to_new_target_head` it moved between, the requester, a timestamp, and
+its own local acknowledgment. Entries must chain (each `from_new_target_head`
+equal to the previous entry's `to_new_target_head`), and the journal's current
+`new_target_head` must equal the last entry's `to_new_target_head`; any gap,
+reordering, or disagreement fails closed rather than being reinterpreted.
+
+Re-anchoring only ever moves `new_target_head` forward to a Git-verified
+descendant of the journal's current target (via the same ancestry check used
+elsewhere) and resets this attempt's own replay evidence (`conflict_paths`,
+`validation`, `setup`, and, if the prior attempt had reached `committed`, the
+tentative `reconciled_commit`/`outcome`/`revision_issue`/`revision_class`,
+returning `status` to `pending` for a clean retry). It never touches the
+immutable original completed-run evidence — `previous_target_head`,
+`previous_implementation_commit`, `test_commit`, `approved_scope`,
+`approved_test_boundary`, the recovered candidate and its identity, or the
+recorded draft PR identity — which continue to be independently re-verified
+against a freshly reconstructed source on every invocation regardless of any
+re-anchor. A journal whose target has not advanced is left untouched.
+
 ### Recovering a superseded false revision classification
 
 A finalized completed-run reconciliation journal is ordinarily terminal.

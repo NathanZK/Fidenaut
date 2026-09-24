@@ -10163,6 +10163,392 @@ class RevisionAndPrRevisionTest(AgentWorkflowTest):
         self.assertEqual("invalid-git-ancestry", payload["error"]["code"])
         self.assertEqual(before, self.state_for(self.PARENT_ISSUE))
 
+    # -- Issue #28: completed-run reconciliation journal target provenance --
+
+    FAILING_SETUP = [
+        {
+            "name": "unavailable-tool",
+            "command": [sys.executable, "-c", "raise SystemExit(1)"],
+            "cwd": ".",
+            "passed": False,
+            "result": {"outcome": "nonzero-exit", "exit_code": 1},
+        }
+    ]
+
+    def _force_pending_completed_run_journal(self, issue):
+        """Drive one failing-setup attempt so a pending journal is durably
+        written (bound to whatever target is currently authoritative) without
+        ever finalizing a reconciliation. Mirrors
+        `test_reconcile_completed_run_scratch_setup_failure_fails_closed_without_test_revision`."""
+        with mock.patch.object(
+            workflow, "_run_validation_setup", return_value=self.FAILING_SETUP
+        ):
+            code, payload, _ = self.reconcile_completed_run(issue)
+        self.assertEqual(1, code)
+        self.assertEqual("validation-setup-failed", payload["error"]["code"])
+        return json.loads(
+            self.completed_run_reconciliation_journal_path(issue).read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def test_reconcile_completed_run_reanchors_pending_journal_target_and_reconciles(
+        self,
+    ):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        original_target = parent_state["target_head"]
+        original_implementation = parent_state["implementation_commit"]
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=original_implementation,
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        intermediate_target = self.advance_remote_ref_past_commit(
+            original_target,
+            {"unrelated-1.txt": "first downstream unrelated change\n"},
+            name="authorized unrelated downstream merge one",
+        )
+        pending_journal = self._force_pending_completed_run_journal(self.PARENT_ISSUE)
+        self.assertEqual("pending", pending_journal["status"])
+        self.assertEqual(intermediate_target, pending_journal["new_target_head"])
+        self.assertFalse(pending_journal.get("target_reanchors"))
+
+        final_target = self.advance_remote_ref_past_commit(
+            intermediate_target,
+            {"unrelated-2.txt": "second downstream unrelated change\n"},
+            name="authorized unrelated downstream merge two",
+        )
+
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": original_implementation,
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(0, code)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("WORKFLOW_COMPLETED", payload["status"])
+        after = self.state_for(self.PARENT_ISSUE)
+        self.assertEqual(final_target, after["target_head"])
+
+        journal = json.loads(
+            self.completed_run_reconciliation_journal_path(
+                self.PARENT_ISSUE
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual("finalized", journal["status"])
+        self.assertEqual("reconciled", journal["outcome"])
+        # The core defect: the finalized journal's own new_target_head must
+        # match the target actually replayed against and recorded in state,
+        # not the stale target captured when the pending journal was first
+        # created.
+        self.assertEqual(final_target, journal["new_target_head"])
+        self.assertEqual(journal["reconciled_commit"], after["implementation_commit"])
+        reanchors = journal.get("target_reanchors") or []
+        self.assertEqual(1, len(reanchors))
+        self.assertEqual(intermediate_target, reanchors[0]["from_new_target_head"])
+        self.assertEqual(final_target, reanchors[0]["to_new_target_head"])
+        self.assertIn("reanchor_id", reanchors[0])
+        self.assertIn("acknowledgment", reanchors[0])
+        # The original completed-run candidate/evidence boundary is preserved
+        # verbatim across the re-anchor.
+        self.assertEqual(original_target, journal["previous_target_head"])
+        self.assertEqual(original_implementation, journal["previous_implementation_commit"])
+        self.assertEqual(
+            pending_journal["implementation_candidate"], journal["implementation_candidate"]
+        )
+        self.assertEqual(pending_journal["candidate_identity"], journal["candidate_identity"])
+        self.assertEqual(
+            pending_journal["approved_test_boundary"], journal["approved_test_boundary"]
+        )
+
+    def test_reconcile_completed_run_unchanged_target_retry_leaves_journal_unreanchored(
+        self,
+    ):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        original_target = parent_state["target_head"]
+        original_implementation = parent_state["implementation_commit"]
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=original_implementation,
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        advanced_target = self.advance_remote_ref_past_commit(
+            original_target,
+            {"unrelated.txt": "downstream unrelated change\n"},
+            name="authorized unrelated downstream merge",
+        )
+        pending_journal = self._force_pending_completed_run_journal(self.PARENT_ISSUE)
+        self.assertEqual(advanced_target, pending_journal["new_target_head"])
+        self.assertFalse(pending_journal.get("target_reanchors"))
+
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": original_implementation,
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(0, code)
+        after = self.state_for(self.PARENT_ISSUE)
+        self.assertEqual(advanced_target, after["target_head"])
+        journal = json.loads(
+            self.completed_run_reconciliation_journal_path(
+                self.PARENT_ISSUE
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(advanced_target, journal["new_target_head"])
+        self.assertFalse(journal.get("target_reanchors"))
+
+    def test_reconcile_completed_run_reanchor_requires_implementation_revision_when_new_target_conflicts(
+        self,
+    ):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        original_target = parent_state["target_head"]
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        intermediate_target = self.advance_remote_ref_past_commit(
+            original_target,
+            {"unrelated.txt": "downstream unrelated change\n"},
+            name="authorized unrelated downstream merge",
+        )
+        pending_journal = self._force_pending_completed_run_journal(self.PARENT_ISSUE)
+        self.assertEqual(intermediate_target, pending_journal["new_target_head"])
+
+        conflict_target = self.advance_remote_ref_past_commit(
+            intermediate_target,
+            {"docs/example.md": "# Example\n\nconflicting downstream documentation\n"},
+            name="authorized conflicting downstream merge",
+        )
+
+        code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(0, code)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("implementation", payload["revision"]["class"])
+        revision_state = self.state_for(payload["revision"]["issue"])
+        self.assertEqual("IMPLEMENTATION", revision_state["status"])
+        journal = json.loads(
+            self.completed_run_reconciliation_journal_path(
+                self.PARENT_ISSUE
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual("finalized", journal["status"])
+        self.assertEqual("revision", journal["outcome"])
+        self.assertEqual(conflict_target, journal["new_target_head"])
+        reanchors = journal.get("target_reanchors") or []
+        self.assertEqual(1, len(reanchors))
+        self.assertEqual(intermediate_target, reanchors[0]["from_new_target_head"])
+        self.assertEqual(conflict_target, reanchors[0]["to_new_target_head"])
+
+    def test_reconcile_completed_run_reanchor_recovers_after_interrupted_finalization(
+        self,
+    ):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        original_target = parent_state["target_head"]
+        original_implementation = parent_state["implementation_commit"]
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=original_implementation,
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        intermediate_target = self.advance_remote_ref_past_commit(
+            original_target,
+            {"unrelated-1.txt": "first downstream unrelated change\n"},
+            name="authorized unrelated downstream merge one",
+        )
+        self._force_pending_completed_run_journal(self.PARENT_ISSUE)
+
+        final_target = self.advance_remote_ref_past_commit(
+            intermediate_target,
+            {"unrelated-2.txt": "second downstream unrelated change\n"},
+            name="authorized unrelated downstream merge two",
+        )
+
+        # Simulate a crash exactly after a prior process durably recorded the
+        # re-anchor's append-only transition and advanced new_target_head,
+        # but before the subsequent attempt/finalization ran to completion.
+        journal_path = self.completed_run_reconciliation_journal_path(self.PARENT_ISSUE)
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        reanchor_acknowledgment = {
+            "kind": workflow.LOCAL_ACKNOWLEDGMENT_KIND,
+            "asserted_by": "owner",
+            "confirmation": "completed_run_reconciled",
+            "recorded_at": "2020-01-01T00:00:00+00:00",
+            "independent_authorization": False,
+        }
+        journal["new_target_head"] = final_target
+        journal["target_reanchors"] = [
+            {
+                "reanchor_id": "interrupted-hop",
+                "from_new_target_head": intermediate_target,
+                "to_new_target_head": final_target,
+                "requested_by": "owner",
+                "requested_at": "2020-01-01T00:00:00+00:00",
+                "acknowledgment": reanchor_acknowledgment,
+            }
+        ]
+        journal["conflict_paths"] = []
+        journal["validation"] = None
+        journal["setup"] = None
+        journal_path.write_text(json.dumps(journal, indent=2) + "\n", encoding="utf-8")
+
+        initial_pr = {
+            "number": 300,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "parent-branch",
+            "headRefOid": original_implementation,
+            "headRepository": {"nameWithOwner": "owner/repo"},
+            "url": "https://example.test/pr/300",
+        }
+        with self.patch_gh_view_and_reflect_push(initial_pr):
+            code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(0, code)
+        self.assertTrue(payload["ok"])
+        after = self.state_for(self.PARENT_ISSUE)
+        self.assertEqual(final_target, after["target_head"])
+        journal_after = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertEqual("finalized", journal_after["status"])
+        self.assertEqual(final_target, journal_after["new_target_head"])
+        # Resumed against the already-recorded re-anchor hop: exactly one
+        # entry, never a second/duplicate re-anchor derived independently.
+        reanchors_after = journal_after.get("target_reanchors") or []
+        self.assertEqual(1, len(reanchors_after))
+        self.assertEqual(final_target, reanchors_after[0]["to_new_target_head"])
+
+    def test_reconcile_completed_run_rejects_journal_with_non_chaining_target_reanchors(
+        self,
+    ):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        original_target = parent_state["target_head"]
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        intermediate_target = self.advance_remote_ref_past_commit(
+            original_target,
+            {"unrelated-1.txt": "first downstream unrelated change\n"},
+            name="authorized unrelated downstream merge one",
+        )
+        self._force_pending_completed_run_journal(self.PARENT_ISSUE)
+        self.advance_remote_ref_past_commit(
+            intermediate_target,
+            {"unrelated-2.txt": "second downstream unrelated change\n"},
+            name="authorized unrelated downstream merge two",
+        )
+
+        journal_path = self.completed_run_reconciliation_journal_path(self.PARENT_ISSUE)
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        # Tamper: append a re-anchor entry whose to_new_target_head disagrees
+        # with the journal's own recorded new_target_head, breaking the
+        # required chain.
+        journal["target_reanchors"] = [
+            {
+                "reanchor_id": "tampered",
+                "from_new_target_head": intermediate_target,
+                "to_new_target_head": "f" * 40,
+                "requested_by": "owner",
+                "requested_at": "2020-01-01T00:00:00+00:00",
+                "acknowledgment": {
+                    "kind": workflow.LOCAL_ACKNOWLEDGMENT_KIND,
+                    "asserted_by": "owner",
+                    "confirmation": "completed_run_reconciled",
+                    "recorded_at": "2020-01-01T00:00:00+00:00",
+                    "independent_authorization": False,
+                },
+            }
+        ]
+        journal_path.write_text(json.dumps(journal, indent=2) + "\n", encoding="utf-8")
+
+        code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(1, code)
+        self.assertEqual(
+            "invalid-completed-run-reconciliation-journal", payload["error"]["code"]
+        )
+        self.assertFalse(getattr(self, "git_push_calls", []))
+
+    def test_reconcile_completed_run_rejects_non_ancestral_reanchor_target(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        original_target = parent_state["target_head"]
+        self.set_parent_draft_pr(
+            self.PARENT_ISSUE,
+            number=300,
+            head_ref_name="parent-branch",
+            head_ref_oid=parent_state["implementation_commit"],
+            url="https://example.test/pr/300",
+            repository="owner/repo",
+        )
+        intermediate_target = self.advance_remote_ref_past_commit(
+            original_target,
+            {"unrelated.txt": "first downstream unrelated change\n"},
+            name="authorized unrelated downstream merge",
+        )
+        pending_journal = self._force_pending_completed_run_journal(self.PARENT_ISSUE)
+        self.assertEqual(intermediate_target, pending_journal["new_target_head"])
+
+        # A divergent sibling target: still a direct descendant of the
+        # original recorded target_head (so it passes the pre-existing basic
+        # ancestry check), but NOT reachable from the pending journal's own
+        # recorded new_target_head. Must be rejected as a re-anchor target
+        # rather than accepted merely because it descends from the original
+        # target.
+        divergent_target = self.advance_remote_ref_past_commit(
+            original_target,
+            {"sibling.txt": "divergent sibling downstream change\n"},
+            name="divergent sibling downstream merge",
+        )
+        self.assertNotEqual(divergent_target, intermediate_target)
+
+        before = self.state_for(self.PARENT_ISSUE)
+        code, payload, _ = self.reconcile_completed_run(self.PARENT_ISSUE)
+
+        self.assertEqual(1, code)
+        self.assertEqual("invalid-git-ancestry", payload["error"]["code"])
+        self.assertEqual(before, self.state_for(self.PARENT_ISSUE))
+        unchanged_journal = json.loads(
+            self.completed_run_reconciliation_journal_path(
+                self.PARENT_ISSUE
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(intermediate_target, unchanged_journal["new_target_head"])
+        self.assertFalse(unchanged_journal.get("target_reanchors"))
+
     def test_recover_completed_run_reconciliation_retries_superseded_tooling_failure(self):
         parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
         self.set_parent_draft_pr(

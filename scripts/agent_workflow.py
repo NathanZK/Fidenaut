@@ -9187,6 +9187,71 @@ def _require_completed_run_live_anchor(root, config, source, context):
     )
 
 
+def _validate_completed_run_target_reanchors(journal, config, context):
+    """Fail closed on any inconsistent completed-run journal target re-anchor chain.
+
+    ``target_reanchors`` is an append-only record of every occasion a
+    pending (or interrupted, not-yet-finalized) completed-run reconciliation
+    journal had its own ``new_target_head`` advanced to a fresher
+    authoritative target before finalization (issue #28). It is optional:
+    a journal that has never been re-anchored omits it or carries an empty
+    list. When present, each entry's ``from_new_target_head`` must chain to
+    the previous entry's ``to_new_target_head`` and the journal's current
+    ``new_target_head`` must equal the last entry's ``to_new_target_head``.
+    A malformed, non-chaining, or disagreeing list can never be trusted as
+    an accurate re-anchor history and fails closed rather than being
+    silently reinterpreted.
+    """
+    target_reanchors = journal.get("target_reanchors")
+    if target_reanchors is None:
+        return
+    _ensure(
+        isinstance(target_reanchors, list),
+        "invalid-completed-run-reconciliation-journal",
+        "%s completed-run reconciliation journal has an invalid target_reanchors list"
+        % context,
+    )
+    previous_to = None
+    for entry in target_reanchors:
+        _ensure(
+            isinstance(entry, dict)
+            and isinstance(entry.get("reanchor_id"), str)
+            and entry.get("reanchor_id")
+            and isinstance(entry.get("from_new_target_head"), str)
+            and entry.get("from_new_target_head")
+            and isinstance(entry.get("to_new_target_head"), str)
+            and entry.get("to_new_target_head")
+            and isinstance(entry.get("requested_by"), str)
+            and entry.get("requested_by")
+            and isinstance(entry.get("requested_at"), str)
+            and entry.get("requested_at"),
+            "invalid-completed-run-reconciliation-journal",
+            "%s completed-run reconciliation journal has an invalid target_reanchors entry"
+            % context,
+        )
+        _validate_journal_acknowledgment(
+            config,
+            entry.get("acknowledgment"),
+            "completed_run_reconciliation",
+            "invalid-completed-run-reconciliation-journal",
+        )
+        if previous_to is not None:
+            _ensure(
+                entry["from_new_target_head"] == previous_to,
+                "invalid-completed-run-reconciliation-journal",
+                "%s completed-run reconciliation journal target_reanchors chain is inconsistent"
+                % context,
+            )
+        previous_to = entry["to_new_target_head"]
+    if target_reanchors:
+        _ensure(
+            journal.get("new_target_head") == previous_to,
+            "invalid-completed-run-reconciliation-journal",
+            "%s completed-run reconciliation journal new_target_head disagrees with its "
+            "target_reanchors chain" % context,
+        )
+
+
 def _validate_completed_run_reconciliation_journal(
         journal, config, state, context, source=None
 ):
@@ -9212,6 +9277,7 @@ def _validate_completed_run_reconciliation_journal(
             "completed_run_reconciliation",
             "invalid-completed-run-reconciliation-journal",
         )
+        _validate_completed_run_target_reanchors(journal, config, context)
         if source is None:
             return
         _ensure(
@@ -9644,6 +9710,54 @@ def _start_completed_run_revision(
         return revision
 
 
+def _reanchor_completed_run_journal_if_advanced(
+        root, config, journal, journal_path, new_target, args, acknowledgment, context
+):
+    """Re-anchor an existing non-finalized completed-run reconciliation journal
+    onto a freshly resolved authoritative target, in place, before any replay.
+
+    Fixes issue #28: a pending (or interrupted, uncommitted-to-state)
+    journal's own ``new_target_head`` is otherwise never updated on retry,
+    even though replay and finalization always use the freshly resolved
+    target. Mutates only ``new_target_head``, the append-only
+    ``target_reanchors`` list, and the per-attempt fields that already
+    describe this attempt's *replay* result (never the immutable original
+    completed-run candidate/evidence fields, which remain independently
+    re-verified against ``source`` by the caller). No-ops when the journal's
+    recorded target already matches ``new_target``.
+    """
+    current_target = journal.get("new_target_head")
+    if current_target == new_target:
+        return
+    _git_ancestor(root, config, current_target, new_target, context)
+    reanchor_entry = {
+        "reanchor_id": uuid.uuid4().hex,
+        "from_new_target_head": current_target,
+        "to_new_target_head": new_target,
+        "requested_by": args.by,
+        "requested_at": _now(),
+        "acknowledgment": acknowledgment,
+    }
+    journal.setdefault("target_reanchors", []).append(reanchor_entry)
+    journal["new_target_head"] = new_target
+    journal["conflict_paths"] = []
+    journal["validation"] = None
+    journal["setup"] = None
+    if journal.get("status") == "committed":
+        # A committed-but-not-yet-finalized outcome (reconciled commit or
+        # revision start) described replay against the now-stale target;
+        # it is superseded rather than finalized, exactly like any other
+        # retry that recomputes `attempt` from scratch below.
+        journal["status"] = "pending"
+        journal["reconciled_commit"] = None
+        journal["committed_at"] = None
+        journal["outcome"] = None
+        journal["revision_issue"] = None
+        journal["revision_class"] = None
+        journal["target_drift"] = None
+    _write_json(journal_path, journal)
+
+
 def command_reconcile_completed_run(args, root, config):
         context = "reconcile-completed-run"
         state = _read_state(root, config, args.issue)
@@ -9731,6 +9845,9 @@ def command_reconcile_completed_run(args, root, config):
             )
             _validate_completed_run_reconciliation_journal(
                 journal, config, state, context, source=source
+            )
+            _reanchor_completed_run_journal_if_advanced(
+                root, config, journal, journal_path, new_target, args, acknowledgment, context
             )
         else:
             journal = {
