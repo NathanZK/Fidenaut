@@ -51,6 +51,8 @@ COMPLETED_RUN_RECONCILIATION_JOURNAL_FORMAT = (
 COMPLETED_RUN_RECONCILIATION_JOURNAL_STATUSES = ("pending", "committed", "finalized")
 LOCAL_ACKNOWLEDGMENT_KIND = "self-attested-local-acknowledgment"
 SUPERSESSION_FORMAT = "chess-echo-skill-workflow-supersession-v1"
+PROVIDER_RUNTIME_MANIFEST_FORMAT = "fidenaut-provider-runtime-manifest-v1"
+PROVIDER_RUNTIME_MANIFEST_ENV = "FIDENAUT_PROVIDER_RUNTIME_MANIFEST"
 
 # Supersession is reserved for runs that have already cleared every human
 # approval gate and are stalled only on provenance discovered after the
@@ -285,6 +287,11 @@ def _read_state(root, config, issue):
         state.get("status") in STATUS_SEQUENCE,
         "invalid-state",
         "Workflow state at %s has unknown status" % state_file,
+    )
+    _ensure(
+        state.get("provider_runtime") == _provider_runtime_identity(root, config),
+        "provider-runtime-identity-mismatch",
+        "workflow state provider runtime identity does not match current provider inputs",
     )
     return state
 
@@ -717,6 +724,141 @@ def _github_command(config, *parts):
     return list(config["workflow"]["execution"]["github"]["command"]) + list(parts)
 
 
+def _provider_runtime_manifest_path(root, config):
+    supplied = os.environ.get(PROVIDER_RUNTIME_MANIFEST_ENV)
+    if not supplied:
+        return None
+    path = pathlib.Path(supplied).expanduser()
+    if not path.is_absolute():
+        path = (root / path).resolve()
+    else:
+        path = path.resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError:
+        return path
+    _raise(
+        "invalid-provider-runtime-manifest",
+        "provider runtime manifest must be outside the consumer worktree",
+    )
+
+
+def _validate_provider_runtime_path(path, context):
+    _ensure(
+        isinstance(path, str) and path and not path.startswith("/") and "\\" not in path,
+        "invalid-provider-runtime-manifest",
+        "%s provider path must be repository-relative" % context,
+    )
+    parts = pathlib.PurePosixPath(path).parts
+    _ensure(
+        parts and all(part not in ("", ".", "..") for part in parts),
+        "invalid-provider-runtime-manifest",
+        "%s provider path escapes the repository: %s" % (context, path),
+    )
+    return path
+
+
+def _provider_file_identity(root, path, context):
+    full_path = root / path
+    try:
+        if full_path.is_symlink():
+            mode = "120000"
+            data = os.readlink(full_path).encode("utf-8")
+        else:
+            data = full_path.read_bytes()
+            mode = "100755" if os.access(full_path, os.X_OK) else "100644"
+    except (FileNotFoundError, IsADirectoryError):
+        _raise(
+            "provider-runtime-integrity-mismatch",
+            "%s provider file is missing or not a regular file: %s" % (context, path),
+        )
+    return {"path": path, "mode": mode, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def _provider_runtime_identity(root, config):
+    manifest_path = _provider_runtime_manifest_path(root, config)
+    if manifest_path is None:
+        return None
+    manifest = _read_json(manifest_path, "provider runtime manifest")
+    _ensure(
+        manifest.get("format") == PROVIDER_RUNTIME_MANIFEST_FORMAT,
+        "invalid-provider-runtime-manifest",
+        "provider runtime manifest has an invalid format",
+    )
+    provider = manifest.get("provider")
+    _ensure(
+        isinstance(provider, dict)
+        and isinstance(provider.get("revision"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", provider["revision"]),
+        "invalid-provider-runtime-manifest",
+        "provider runtime manifest requires a verified provider revision",
+    )
+    files = manifest.get("files")
+    _ensure(
+        isinstance(files, list) and files,
+        "invalid-provider-runtime-manifest",
+        "provider runtime manifest requires provider files",
+    )
+    normalized = []
+    seen = set()
+    for item in files:
+        _ensure(
+            isinstance(item, dict),
+            "invalid-provider-runtime-manifest",
+            "provider runtime file entries must be objects",
+        )
+        path = _validate_provider_runtime_path(item.get("path"), "provider manifest")
+        _ensure(
+            path not in seen,
+            "invalid-provider-runtime-manifest",
+            "provider runtime manifest duplicates path: %s" % path,
+        )
+        seen.add(path)
+        mode = item.get("mode")
+        digest = item.get("sha256")
+        _ensure(
+            mode in ("100644", "100755", "120000")
+            and isinstance(digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", digest),
+            "invalid-provider-runtime-manifest",
+            "provider runtime identity is invalid for %s" % path,
+        )
+        actual = _provider_file_identity(root, path, "provider runtime manifest")
+        _ensure(
+            actual == {"path": path, "mode": mode, "sha256": digest},
+            "provider-runtime-integrity-mismatch",
+            "provider runtime file does not match its verified identity: %s" % path,
+        )
+        normalized.append(actual)
+    normalized.sort(key=lambda item: item["path"])
+    identity = {
+        "format": PROVIDER_RUNTIME_MANIFEST_FORMAT,
+        "provider": {
+            "repository": provider.get("repository"),
+            "revision": provider["revision"],
+        },
+        "files": normalized,
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    identity["manifest_sha256"] = hashlib.sha256(encoded).hexdigest()
+    return identity
+
+
+def _provider_runtime_paths(root, config):
+    identity = _provider_runtime_identity(root, config)
+    return {item["path"] for item in identity["files"]} if identity else set()
+
+
+def _is_provider_runtime_manifest_path(root, config, path):
+    manifest_path = _provider_runtime_manifest_path(root, config)
+    if manifest_path is None or not path:
+        return False
+    candidate = pathlib.Path(path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    return candidate.resolve() == manifest_path
+
+
 def _current_head(root, config):
     limits = _effective_limits(config, "git")
     completed = _run_checked(
@@ -744,6 +886,8 @@ def _is_workflow_owned_path(root, config, path):
     """Ignore the configured workflow state directory while keeping source dirtiness checks strict."""
     if not path:
         return False
+    if _is_provider_runtime_manifest_path(root, config, path):
+        return True
     run_root = _artifact_root(root, config)
     candidate = pathlib.Path(path)
     if not candidate.is_absolute():
@@ -758,24 +902,7 @@ def _is_workflow_owned_path(root, config, path):
 
 
 def _git_status(root, config):
-    completed = _run_checked(
-        _git_command(config, "status", "--porcelain"),
-        _effective_limits(config, "git"),
-        root,
-        "git-status-failed",
-        "unable to inspect working tree",
-    )
-    rows = []
-    for line in completed["stdout_text"].splitlines():
-        if not line:
-            continue
-        path = _status_path(line)
-        if not _is_workflow_owned_path(root, config, path):
-            rows.append(line)
-    return rows
-
-
-def _git_status_all(root, config):
+    provider_paths = _provider_runtime_paths(root, config)
     completed = _run_checked(
         _git_command(config, "status", "--porcelain", "--untracked-files=all"),
         _effective_limits(config, "git"),
@@ -788,7 +915,26 @@ def _git_status_all(root, config):
         if not line:
             continue
         path = _status_path(line)
-        if not _is_workflow_owned_path(root, config, path):
+        if not _is_workflow_owned_path(root, config, path) and path not in provider_paths:
+            rows.append(line)
+    return rows
+
+
+def _git_status_all(root, config):
+    provider_paths = _provider_runtime_paths(root, config)
+    completed = _run_checked(
+        _git_command(config, "status", "--porcelain", "--untracked-files=all"),
+        _effective_limits(config, "git"),
+        root,
+        "git-status-failed",
+        "unable to inspect working tree",
+    )
+    rows = []
+    for line in completed["stdout_text"].splitlines():
+        if not line:
+            continue
+        path = _status_path(line)
+        if not _is_workflow_owned_path(root, config, path) and path not in provider_paths:
             rows.append(line)
     return rows
 
@@ -845,13 +991,20 @@ def _git_candidate_diff(root, config, revision):
         "git-revision-failed",
         "unable to resolve candidate base revision",
     )
-    tracked = _run_checked(
-        _git_command(config, "diff", "--binary", revision, "--"),
-        _effective_limits(config, "git"),
-        root,
-        "git-diff-failed",
-        "unable to compute candidate diff",
-    )["stdout_text"]
+    provider_paths = _provider_runtime_paths(root, config)
+    tracked_paths = [
+        path for path in _git_diff_names(root, config, revision)
+        if path not in provider_paths
+    ]
+    tracked = ""
+    if tracked_paths:
+        tracked = _run_checked(
+            _git_command(config, "diff", "--binary", revision, "--", *tracked_paths),
+            _effective_limits(config, "git"),
+            root,
+            "git-diff-failed",
+            "unable to compute candidate diff",
+        )["stdout_text"]
 
     status = _run_checked(
         _git_command(config, "status", "--porcelain", "--untracked-files=all"),
@@ -863,7 +1016,7 @@ def _git_candidate_diff(root, config, revision):
     untracked = [
         line[3:]
         for line in status.splitlines()
-        if line.startswith("?? ")
+        if line.startswith("?? ") and line[3:] not in provider_paths
     ]
     additions = []
     for path in sorted(untracked):
@@ -885,7 +1038,11 @@ def _git_candidate_diff(root, config, revision):
 
 def _git_candidate_names(root, config, revision):
     """Return tracked and untracked paths represented by the candidate."""
-    names = set(_git_diff_names(root, config, revision))
+    provider_paths = _provider_runtime_paths(root, config)
+    names = {
+        path for path in _git_diff_names(root, config, revision)
+        if path not in provider_paths
+    }
     status = _run_checked(
         _git_command(config, "status", "--porcelain", "--untracked-files=all"),
         _effective_limits(config, "git"),
@@ -896,7 +1053,7 @@ def _git_candidate_names(root, config, revision):
     names.update(
         line[3:]
         for line in status.splitlines()
-        if line.startswith("?? ")
+        if line.startswith("?? ") and line[3:] not in provider_paths
     )
     return sorted(names)
 
@@ -4843,6 +5000,7 @@ def command_init(args, root, config):
     publication_branch = _require_publishable_head(root, config, "init")
     initial_head = _current_head(root, config)
     target_head = _resolve_target_head(root, config, fetch=True)
+    provider_runtime = _provider_runtime_identity(root, config)
     _ensure(
         initial_head == target_head,
         "workflow-start-not-at-target",
@@ -4862,6 +5020,7 @@ def command_init(args, root, config):
         "initial_head": initial_head,
         "base_head": target_head,
         "target_head": target_head,
+        "provider_runtime": provider_runtime,
         "publication_branch": publication_branch,
         "approved_scope": None,
         "test_commit": None,
