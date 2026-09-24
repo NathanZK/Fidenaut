@@ -2739,8 +2739,9 @@ def _require_production_only(paths, scope, context):
         "missing-implementation-commit",
         "%s must contain at least one production change" % context,
     )
+    _require_candidate_scope(paths, scope, context)
     _ensure(
-        all(not _is_test_file(path) and _path_in_scope(path, scope) for path in paths),
+        all(not _is_test_file(path) for path in paths),
         "implementation-test-modification",
         "%s may change only approved production files: %s" % (context, ", ".join(paths)),
     )
@@ -3569,6 +3570,35 @@ def _hide_untracked_status_after_interruption(root, config):
     )
 
 
+def _stage_implementation_paths(root, config, paths, context):
+    """Stage only approved consumer candidate paths, never verified provider inputs."""
+    provider_paths = _provider_runtime_paths(root, config)
+    stage_paths = sorted(path for path in paths if path not in provider_paths)
+    _ensure(
+        stage_paths,
+        "missing-implementation-candidate",
+        "%s requires consumer implementation paths to stage" % context,
+    )
+    _run_checked(
+        _git_command(config, "add", "-A", "--", *stage_paths),
+        _effective_limits(config, "git"),
+        root,
+        "git-add-failed",
+        "unable to stage implementation changes",
+    )
+
+
+def _rollback_rejected_implementation_commit(root, config, expected_head, context):
+    """Return from a rejected post-commit verification to the approved candidate base."""
+    _run_checked(
+        _git_command(config, "reset", "--mixed", expected_head),
+        _effective_limits(config, "git"),
+        root,
+        "git-reset-failed",
+        "%s rejected implementation commit could not be rolled back" % context,
+    )
+
+
 def _verify_authoritative_implementation(
     root, config, state, journal, authoritative_head, context
 ):
@@ -3879,12 +3909,11 @@ def command_recover_implementation_approval(args, root, config):
         authoritative_head = _current_head(root, config)
     else:
         if shape == "uncommitted-candidate":
-            _run_checked(
-                _git_command(config, "add", "-A"),
-                _effective_limits(config, "git"),
+            _stage_implementation_paths(
                 root,
-                "git-add-failed",
-                "unable to stage implementation changes during recovery",
+                config,
+                journal["implementation_candidate"]["candidate_paths"],
+                "recover-implementation-approval",
             )
         if shape in ("uncommitted-candidate", "staged-candidate"):
             _run_checked(
@@ -3925,14 +3954,24 @@ def command_recover_implementation_approval(args, root, config):
     committed_journal = dict(journal)
     committed_journal["status"] = "committed-but-not-persisted"
     committed_journal["authoritative_commit"] = authoritative_head
-    _verify_authoritative_implementation(
-        root,
-        config,
-        state,
-        committed_journal,
-        authoritative_head,
-        "recover-implementation-approval",
-    )
+    try:
+        _verify_authoritative_implementation(
+            root,
+            config,
+            state,
+            committed_journal,
+            authoritative_head,
+            "recover-implementation-approval",
+        )
+    except WorkflowError:
+        if shape != "authoritative":
+            _rollback_rejected_implementation_commit(
+                root,
+                config,
+                journal["test_commit"],
+                "recover-implementation-approval",
+            )
+        raise
     _persist_finalized_transition(
         root, config, state, committed_journal, authoritative_head
     )
@@ -7091,9 +7130,6 @@ def command_approve_implementation(args, root, config):
         "approve-implementation requires HEAD to match approved test_commit",
     )
     _git_ancestor(root, config, target_head, test_commit, "approve-implementation")
-    current_candidate = _require_implementation_candidate_matches(
-        root, config, state, "approve-implementation"
-    )
 
     # Verify approved tests remain unchanged
     changed_names = _git_candidate_names(root, config, test_commit)
@@ -7102,8 +7138,10 @@ def command_approve_implementation(args, root, config):
         "tests-modified-after-approval",
         "approve-implementation requires approved tests to remain unchanged",
     )
-    candidate_names = _git_candidate_names(root, config, test_commit)
-    _require_production_only(candidate_names, scope, "approve-implementation")
+    _require_production_only(changed_names, scope, "approve-implementation")
+    current_candidate = _require_implementation_candidate_matches(
+        root, config, state, "approve-implementation"
+    )
 
     journal = _build_implementation_transition_journal(
         root, config, state, acknowledgment
@@ -7119,12 +7157,11 @@ def command_approve_implementation(args, root, config):
     # Create the single authoritative implementation commit relative to the
     # verified target base, containing approved tests plus reviewed production.
     try:
-        _run_checked(
-            _git_command(config, "add", "-A"),
-            _effective_limits(config, "git"),
+        _stage_implementation_paths(
             root,
-            "git-add-failed",
-            "unable to stage implementation changes",
+            config,
+            current_candidate["candidate_paths"],
+            "approve-implementation",
         )
     except WorkflowError:
         _hide_untracked_status_after_interruption(root, config)
@@ -7153,14 +7190,20 @@ def command_approve_implementation(args, root, config):
         "unable to create authoritative implementation commit",
     )
     authoritative_head = _current_head(root, config)
-    _verify_authoritative_implementation(
-        root,
-        config,
-        state,
-        journal,
-        authoritative_head,
-        "approve-implementation",
-    )
+    try:
+        _verify_authoritative_implementation(
+            root,
+            config,
+            state,
+            journal,
+            authoritative_head,
+            "approve-implementation",
+        )
+    except WorkflowError:
+        _rollback_rejected_implementation_commit(
+            root, config, test_commit, "approve-implementation"
+        )
+        raise
     journal = _persist_finalized_transition(
         root, config, state, journal, authoritative_head
     )
