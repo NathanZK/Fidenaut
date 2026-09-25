@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -2595,6 +2596,335 @@ class AgentWorkflowTest(unittest.TestCase):
             encoding="utf-8",
         )
         return manifest
+
+    def external_provider_runtime(self, files):
+        """Create a pinned runtime separate from this fixture's consumer root."""
+        runtime = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(runtime))
+        entries = []
+        for relative_path, content in files.items():
+            path = runtime / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            entries.append(
+                {
+                    "path": relative_path,
+                    "mode": "100644",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            )
+        for arguments in (
+            ("init", "-q"),
+            ("config", "user.email", "provider@example.test"),
+            ("config", "user.name", "Provider Runtime"),
+            ("add", "."),
+            ("commit", "-qm", "pinned provider runtime"),
+            ("remote", "add", "origin", "https://github.com/NathanZK/Fidenaut.git"),
+        ):
+            subprocess.run(
+                ["git", *arguments],
+                cwd=runtime,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=runtime,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+        manifest = pathlib.Path(self.provider_manifest_temporary.name) / (
+            "external-provider-runtime-manifest.json"
+        )
+        manifest.write_text(
+            json.dumps(
+                {
+                    "format": workflow.PROVIDER_RUNTIME_MANIFEST_FORMAT,
+                    "provider": {
+                        "repository": "github.com/NathanZK/Fidenaut",
+                        "revision": revision,
+                    },
+                    "files": entries,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return runtime, manifest
+
+    def test_external_runner_separates_consumer_and_provider_runtime_roots(self):
+        """A verified external runtime governs consumer state without an overlay."""
+        runtime, manifest = self.external_provider_runtime(
+            {
+                "scripts/agent_workflow.py": pathlib.Path(workflow.__file__).read_bytes(),
+                "scripts/workflow_supervisor.py": pathlib.Path(
+                    workflow.workflow_supervisor.__file__
+                ).read_bytes(),
+            }
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(runtime / "scripts" / "agent_workflow.py"),
+                "init",
+                "654",
+                "--consumer-root",
+                str(self.root),
+                "--provider-runtime-root",
+                str(runtime),
+                "--provider-manifest",
+                str(manifest),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual("PLANNING", payload["status"])
+        state = json.loads(
+            (
+                self.root
+                / ".agent-workflow"
+                / "runs"
+                / "issue-654"
+                / "state.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            "github.com/NathanZK/Fidenaut",
+            state["provider_runtime"]["provider"]["repository"],
+        )
+        self.assertEqual(
+            [
+                "scripts/agent_workflow.py",
+                "scripts/workflow_supervisor.py",
+            ],
+            [entry["path"] for entry in state["provider_runtime"]["files"]],
+        )
+        self.assertEqual([], workflow._git_status(self.root, self.repository_workflow_config()))
+        consumer_provider_path = self.root / "scripts" / "agent_workflow.py"
+        consumer_provider_path.parent.mkdir(parents=True, exist_ok=True)
+        consumer_provider_path.write_text("consumer change\n", encoding="utf-8")
+        self.assertEqual(
+            ["?? scripts/agent_workflow.py"],
+            workflow._git_status(self.root, self.repository_workflow_config()),
+        )
+
+    def test_external_runner_rejects_tampered_provider_runtime(self):
+        """A changed external runtime fails before it can create consumer state."""
+        runtime, manifest = self.external_provider_runtime(
+            {
+                "scripts/agent_workflow.py": pathlib.Path(workflow.__file__).read_bytes(),
+                "scripts/workflow_supervisor.py": pathlib.Path(
+                    workflow.workflow_supervisor.__file__
+                ).read_bytes(),
+            }
+        )
+        with (runtime / "scripts" / "agent_workflow.py").open(
+            "a", encoding="utf-8"
+        ) as runtime_script:
+            runtime_script.write("\n# tampered\n")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(runtime / "scripts" / "agent_workflow.py"),
+                "init",
+                "655",
+                "--consumer-root",
+                str(self.root),
+                "--provider-runtime-root",
+                str(runtime),
+                "--provider-manifest",
+                str(manifest),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(1, completed.returncode, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(
+            "provider-runtime-integrity-mismatch", payload["error"]["code"]
+        )
+        self.assertFalse(
+            (
+                self.root
+                / ".agent-workflow"
+                / "runs"
+                / "issue-655"
+                / "state.json"
+            ).exists()
+        )
+
+    def test_external_runner_rejects_manifest_file_through_parent_symlink(self):
+        """A manifest entry cannot follow a runtime directory symlink outward."""
+        runtime, manifest = self.external_provider_runtime(
+            {
+                "scripts/agent_workflow.py": pathlib.Path(workflow.__file__).read_bytes(),
+                "scripts/workflow_supervisor.py": pathlib.Path(
+                    workflow.workflow_supervisor.__file__
+                ).read_bytes(),
+            }
+        )
+        escaped = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(escaped))
+        (escaped / "runtime.py").write_text("outside runtime\n", encoding="utf-8")
+        (runtime / "linked").symlink_to(escaped, target_is_directory=True)
+        manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+        manifest_payload["files"].append(
+            {
+                "path": "linked/runtime.py",
+                "mode": "100644",
+                "sha256": hashlib.sha256(
+                    (escaped / "runtime.py").read_bytes()
+                ).hexdigest(),
+            }
+        )
+        manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(runtime / "scripts" / "agent_workflow.py"),
+                "init",
+                "656",
+                "--consumer-root",
+                str(self.root),
+                "--provider-runtime-root",
+                str(runtime),
+                "--provider-manifest",
+                str(manifest),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(1, completed.returncode, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(
+            "provider-runtime-integrity-mismatch", payload["error"]["code"]
+        )
+        self.assertFalse(
+            (
+                self.root
+                / ".agent-workflow"
+                / "runs"
+                / "issue-656"
+                / "state.json"
+            ).exists()
+        )
+
+    def test_external_runner_requires_manifest_coverage_for_supervisor(self):
+        """The executing entry point's required provider module is verified too."""
+        runtime, manifest = self.external_provider_runtime(
+            {
+                "scripts/agent_workflow.py": pathlib.Path(workflow.__file__).read_bytes(),
+                "scripts/workflow_supervisor.py": pathlib.Path(
+                    workflow.workflow_supervisor.__file__
+                ).read_bytes(),
+            }
+        )
+        manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+        manifest_payload["files"] = [
+            entry
+            for entry in manifest_payload["files"]
+            if entry["path"] != "scripts/workflow_supervisor.py"
+        ]
+        manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(runtime / "scripts" / "agent_workflow.py"),
+                "init",
+                "657",
+                "--consumer-root",
+                str(self.root),
+                "--provider-runtime-root",
+                str(runtime),
+                "--provider-manifest",
+                str(manifest),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(1, completed.returncode, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(
+            "provider-runtime-integrity-mismatch", payload["error"]["code"]
+        )
+        self.assertFalse(
+            (
+                self.root
+                / ".agent-workflow"
+                / "runs"
+                / "issue-657"
+                / "state.json"
+            ).exists()
+        )
+
+    def test_external_runner_requires_manifest_coverage_for_entry_point(self):
+        """The executing provider entry point itself must be manifest-verified."""
+        runtime, manifest = self.external_provider_runtime(
+            {
+                "scripts/agent_workflow.py": pathlib.Path(workflow.__file__).read_bytes(),
+                "scripts/workflow_supervisor.py": pathlib.Path(
+                    workflow.workflow_supervisor.__file__
+                ).read_bytes(),
+            }
+        )
+        manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+        manifest_payload["files"] = [
+            entry
+            for entry in manifest_payload["files"]
+            if entry["path"] != "scripts/agent_workflow.py"
+        ]
+        manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(runtime / "scripts" / "agent_workflow.py"),
+                "init",
+                "658",
+                "--consumer-root",
+                str(self.root),
+                "--provider-runtime-root",
+                str(runtime),
+                "--provider-manifest",
+                str(manifest),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(1, completed.returncode, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(
+            "provider-runtime-integrity-mismatch", payload["error"]["code"]
+        )
+        self.assertFalse(
+            (
+                self.root
+                / ".agent-workflow"
+                / "runs"
+                / "issue-658"
+                / "state.json"
+            ).exists()
+        )
 
     def test_verified_provider_runtime_is_excluded_without_masking_consumer_changes(self):
         """Pinned provider files are trusted inputs, while consumer edits remain dirty."""

@@ -56,21 +56,16 @@ application dependencies.
 ## External-consumer quickstart
 
 An external consumer pins an exact Fidenaut commit; it does not consume an
-unpinned moving branch. The current runtime consists of these provider-owned
-files:
+unpinned moving branch. The provider runtime and manifest remain outside the
+consumer worktree. The runtime consists of these provider-owned files:
 
 ```text
 scripts/agent_workflow.py
 scripts/workflow_supervisor.py
 ```
 
-The consumer or its harness materializes those files at the pinned revision
-without including them in the consumer's authoritative candidate or commit.
 Fidenaut currently provides no package manager, provider bundle command,
-automatic installer, or fetch mechanism.
-
-Create a manifest outside the consumer worktree. Its current canonical shape
-is:
+automatic installer, or fetch mechanism. Create an external manifest:
 
 ```json
 {
@@ -94,18 +89,30 @@ is:
 }
 ```
 
-Point the runtime at that external manifest for every governed command:
+Invoke the pinned provider entry point with explicit roots for every governed
+command:
 
 ```bash
-export FIDENAUT_PROVIDER_RUNTIME_MANIFEST=/path/outside/consumer/provider-runtime-manifest.json
+python3 /path/to/pinned/fidenaut/scripts/agent_workflow.py init ISSUE \
+  --consumer-root /path/to/consumer \
+  --provider-runtime-root /path/to/pinned/fidenaut \
+  --provider-manifest /path/outside/consumer/provider-runtime-manifest.json
 ```
 
-The runtime verifies the provider revision and every listed path, Git mode, and
-SHA-256. Missing, relocated, changed, malformed, or tampered provider inputs
-fail closed. The manifest identity is captured at `init` and revalidated on
-later state reads. The manifest must be outside the consumer worktree; the
-current contract is the environment variable above, not an in-worktree
-`.agent-workflow/provider-runtime-manifest.json` file.
+Consumer configuration, state, Git operations, target/base topology, and
+application validation resolve only from `--consumer-root`. The provider
+checkout must match the manifest's repository and exact revision. Every
+manifest-listed file is resolved canonically beneath
+`--provider-runtime-root`, then checked for path, Git mode, and SHA-256.
+The manifest must list the executing `scripts/agent_workflow.py` and its
+required `scripts/workflow_supervisor.py`. Missing, relocated, changed,
+malformed, symlink-escaping, or tampered provider inputs fail closed before
+consumer workflow state progresses. The manifest identity is captured at
+`init` and revalidated on later state reads.
+
+The legacy `FIDENAUT_PROVIDER_RUNTIME_MANIFEST` environment variable remains
+available only for ordinary in-repository compatibility invocation; it cannot
+be combined with `--provider-manifest`.
 
 Keep the consumer's own configuration and select its own application
 validation profile. Fidenaut's provider tests are not a replacement for
