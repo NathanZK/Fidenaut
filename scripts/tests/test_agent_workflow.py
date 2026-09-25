@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -2595,6 +2596,95 @@ class AgentWorkflowTest(unittest.TestCase):
             encoding="utf-8",
         )
         return manifest
+
+    def external_provider_runtime(self, files):
+        """Create a pinned runtime separate from this fixture's consumer root."""
+        runtime = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(runtime))
+        entries = []
+        for relative_path, content in files.items():
+            path = runtime / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            entries.append(
+                {
+                    "path": relative_path,
+                    "mode": "100644",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            )
+        manifest = pathlib.Path(self.provider_manifest_temporary.name) / (
+            "external-provider-runtime-manifest.json"
+        )
+        manifest.write_text(
+            json.dumps(
+                {
+                    "format": workflow.PROVIDER_RUNTIME_MANIFEST_FORMAT,
+                    "provider": {
+                        "repository": "github.com/NathanZK/Fidenaut",
+                        "revision": "4881ea2c502750cfcb68197e88b089d5ed2f5698",
+                    },
+                    "files": entries,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return runtime, manifest
+
+    def test_external_runner_separates_consumer_and_provider_runtime_roots(self):
+        """A verified external runtime governs consumer state without an overlay."""
+        runtime, manifest = self.external_provider_runtime(
+            {
+                "scripts/agent_workflow.py": b"provider workflow\n",
+                "scripts/workflow_supervisor.py": b"provider supervisor\n",
+            }
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = workflow.main(
+                [
+                    "init",
+                    "654",
+                    "--consumer-root",
+                    str(self.root),
+                    "--provider-runtime-root",
+                    str(runtime),
+                    "--provider-manifest",
+                    str(manifest),
+                ]
+            )
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(0, code)
+        self.assertEqual("PLANNING", payload["status"])
+        state = json.loads(
+            (
+                self.root
+                / ".agent-workflow"
+                / "runs"
+                / "issue-654"
+                / "state.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            "github.com/NathanZK/Fidenaut",
+            state["provider_runtime"]["provider"]["repository"],
+        )
+        self.assertEqual(
+            [
+                "scripts/agent_workflow.py",
+                "scripts/workflow_supervisor.py",
+            ],
+            [entry["path"] for entry in state["provider_runtime"]["files"]],
+        )
+        self.assertEqual([], workflow._git_status(self.root, self.repository_workflow_config()))
+        (self.root / "consumer-change.txt").write_text("consumer change\n", encoding="utf-8")
+        self.assertEqual(
+            ["?? consumer-change.txt"],
+            workflow._git_status(self.root, self.repository_workflow_config()),
+        )
 
     def test_verified_provider_runtime_is_excluded_without_masking_consumer_changes(self):
         """Pinned provider files are trusted inputs, while consumer edits remain dirty."""
