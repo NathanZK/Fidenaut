@@ -2613,6 +2613,30 @@ class AgentWorkflowTest(unittest.TestCase):
                     "sha256": hashlib.sha256(content).hexdigest(),
                 }
             )
+        for arguments in (
+            ("init", "-q"),
+            ("config", "user.email", "provider@example.test"),
+            ("config", "user.name", "Provider Runtime"),
+            ("add", "."),
+            ("commit", "-qm", "pinned provider runtime"),
+            ("remote", "add", "origin", "https://github.com/NathanZK/Fidenaut.git"),
+        ):
+            subprocess.run(
+                ["git", *arguments],
+                cwd=runtime,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=runtime,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
         manifest = pathlib.Path(self.provider_manifest_temporary.name) / (
             "external-provider-runtime-manifest.json"
         )
@@ -2622,7 +2646,7 @@ class AgentWorkflowTest(unittest.TestCase):
                     "format": workflow.PROVIDER_RUNTIME_MANIFEST_FORMAT,
                     "provider": {
                         "repository": "github.com/NathanZK/Fidenaut",
-                        "revision": "4881ea2c502750cfcb68197e88b089d5ed2f5698",
+                        "revision": revision,
                     },
                     "files": entries,
                 },
@@ -2637,27 +2661,32 @@ class AgentWorkflowTest(unittest.TestCase):
         """A verified external runtime governs consumer state without an overlay."""
         runtime, manifest = self.external_provider_runtime(
             {
-                "scripts/agent_workflow.py": b"provider workflow\n",
-                "scripts/workflow_supervisor.py": b"provider supervisor\n",
+                "scripts/agent_workflow.py": pathlib.Path(workflow.__file__).read_bytes(),
+                "scripts/workflow_supervisor.py": pathlib.Path(
+                    workflow.workflow_supervisor.__file__
+                ).read_bytes(),
             }
         )
-        output = io.StringIO()
-        with redirect_stdout(output):
-            code = workflow.main(
-                [
-                    "init",
-                    "654",
-                    "--consumer-root",
-                    str(self.root),
-                    "--provider-runtime-root",
-                    str(runtime),
-                    "--provider-manifest",
-                    str(manifest),
-                ]
-            )
-
-        payload = json.loads(output.getvalue())
-        self.assertEqual(0, code)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(runtime / "scripts" / "agent_workflow.py"),
+                "init",
+                "654",
+                "--consumer-root",
+                str(self.root),
+                "--provider-runtime-root",
+                str(runtime),
+                "--provider-manifest",
+                str(manifest),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        payload = json.loads(completed.stdout)
         self.assertEqual("PLANNING", payload["status"])
         state = json.loads(
             (
@@ -2680,10 +2709,60 @@ class AgentWorkflowTest(unittest.TestCase):
             [entry["path"] for entry in state["provider_runtime"]["files"]],
         )
         self.assertEqual([], workflow._git_status(self.root, self.repository_workflow_config()))
-        (self.root / "consumer-change.txt").write_text("consumer change\n", encoding="utf-8")
+        consumer_provider_path = self.root / "scripts" / "agent_workflow.py"
+        consumer_provider_path.parent.mkdir(parents=True, exist_ok=True)
+        consumer_provider_path.write_text("consumer change\n", encoding="utf-8")
         self.assertEqual(
-            ["?? consumer-change.txt"],
+            ["?? scripts/agent_workflow.py"],
             workflow._git_status(self.root, self.repository_workflow_config()),
+        )
+
+    def test_external_runner_rejects_tampered_provider_runtime(self):
+        """A changed external runtime fails before it can create consumer state."""
+        runtime, manifest = self.external_provider_runtime(
+            {
+                "scripts/agent_workflow.py": pathlib.Path(workflow.__file__).read_bytes(),
+                "scripts/workflow_supervisor.py": pathlib.Path(
+                    workflow.workflow_supervisor.__file__
+                ).read_bytes(),
+            }
+        )
+        with (runtime / "scripts" / "agent_workflow.py").open(
+            "a", encoding="utf-8"
+        ) as runtime_script:
+            runtime_script.write("\n# tampered\n")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(runtime / "scripts" / "agent_workflow.py"),
+                "init",
+                "655",
+                "--consumer-root",
+                str(self.root),
+                "--provider-runtime-root",
+                str(runtime),
+                "--provider-manifest",
+                str(manifest),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(1, completed.returncode, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(
+            "provider-runtime-integrity-mismatch", payload["error"]["code"]
+        )
+        self.assertFalse(
+            (
+                self.root
+                / ".agent-workflow"
+                / "runs"
+                / "issue-655"
+                / "state.json"
+            ).exists()
         )
 
     def test_verified_provider_runtime_is_excluded_without_masking_consumer_changes(self):
