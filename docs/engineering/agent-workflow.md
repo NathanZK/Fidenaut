@@ -43,18 +43,48 @@ with:
   already-published completed run is reconciled onto an advanced target or
   escalated into an automatic governed revision)
 
-  ### External provider runtime boundary
+### External provider runtime boundary
 
-  An external consumer may materialize a pinned Fidenaut runtime into its
-  disposable worktree without committing provider files to the consumer. The
-  runtime manifest is supplied through the
-  `FIDENAUT_PROVIDER_RUNTIME_MANIFEST` environment variable and must reside
-  outside the consumer worktree. Its provider revision and every listed path,
-  mode, and SHA-256 are verified before provider paths are excluded from
-  consumer clean-tree or candidate calculations. The manifest identity is
-  captured at `init` and every later state read requires the same identity.
-  Missing, malformed, relocated, changed, or tampered provider inputs fail
-  closed; provider paths are not an authorization or candidate-scope bypass.
+An external consumer may materialize a pinned Fidenaut runtime into its
+disposable worktree without committing provider files to the consumer. The
+runtime manifest is supplied through the
+`FIDENAUT_PROVIDER_RUNTIME_MANIFEST` environment variable and **must reside
+outside the consumer worktree**. There is no supported in-worktree manifest
+path; older references to `.agent-workflow/provider-runtime-manifest.json` are
+obsolete.
+
+The manifest format is `fidenaut-provider-runtime-manifest-v1`:
+
+```json
+{
+  "format": "fidenaut-provider-runtime-manifest-v1",
+  "provider": {
+    "repository": "github.com/NathanZK/Fidenaut",
+    "revision": "<40-character-lowercase-commit-sha>"
+  },
+  "files": [
+    {
+      "path": "scripts/agent_workflow.py",
+      "mode": "100755",
+      "sha256": "<sha256>"
+    },
+    {
+      "path": "scripts/workflow_supervisor.py",
+      "mode": "100755",
+      "sha256": "<sha256>"
+    }
+  ]
+}
+```
+
+The provider revision must be an exact 40-character lowercase commit SHA.
+Provider file paths are repository-relative, unique, and may not be absolute,
+contain `..`, or use unsupported modes. Every listed file's mode and SHA-256
+are verified before provider paths are excluded from consumer clean-tree or
+candidate calculations. The manifest identity is captured at `init` and every
+later state read requires the same identity. Missing, malformed, relocated,
+changed, or tampered provider inputs fail closed; provider paths are not an
+authorization or candidate-scope bypass.
 
 The transition journals are created only after each gate's existing
 preconditions pass and after the exact local acknowledgment is accepted, but
@@ -356,7 +386,17 @@ before the implementation Approval Gate and draft PR creation, the workflow fetc
 closed if it advanced. `approve-implementation` creates the single workflow implementation commit
 directly on `target_head`; `create-draft-pr` verifies that the final branch has exactly one commit, that
 `HEAD^` is the target, and that changed paths remain within the approved scope. `create-draft-pr` is a
-workflow action, not an Approval Gate. PR review, CI, and merge remain external GitHub processes.
+workflow action, not an Approval Gate. It does not push the initial
+publication branch: the consumer or harness must create the local non-target
+branch, allow the workflow to create its governed implementation commit, and
+push that branch to the configured authoritative remote before invoking
+`create-draft-pr`. PR review, CI, and merge remain external GitHub processes.
+
+For a disposable end-to-end GitHub publication experiment, the authoritative
+remote must therefore be a genuinely disposable writable fork, mirror, or
+other safe remote. A local branch alone is insufficient for `gh pr create`,
+and an experiment must not push to the real ChessEcho repository merely to
+satisfy this prerequisite.
 
 ### Target drift condition and decision model
 
