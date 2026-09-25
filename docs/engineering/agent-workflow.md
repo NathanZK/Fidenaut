@@ -45,13 +45,20 @@ with:
 
 ### External provider runtime boundary
 
-An external consumer may materialize a pinned Fidenaut runtime into its
-disposable worktree without committing provider files to the consumer. The
-runtime manifest is supplied through the
-`FIDENAUT_PROVIDER_RUNTIME_MANIFEST` environment variable and **must reside
-outside the consumer worktree**. There is no supported in-worktree manifest
-path; older references to `.agent-workflow/provider-runtime-manifest.json` are
-obsolete.
+An external consumer invokes a pinned Fidenaut runtime from a distinct
+provider checkout:
+
+```text
+python3 /path/to/fidenaut/scripts/agent_workflow.py init ISSUE \
+  --consumer-root /path/to/consumer \
+  --provider-runtime-root /path/to/fidenaut \
+  --provider-manifest /path/to/external/provider-runtime-manifest.json
+```
+
+Consumer configuration, state, Git operations, target/base topology, and
+application validation resolve only from `--consumer-root`. Provider code
+executes from `--provider-runtime-root`; the manifest must reside outside the
+consumer worktree.
 
 The manifest format is `fidenaut-provider-runtime-manifest-v1`:
 
@@ -77,14 +84,25 @@ The manifest format is `fidenaut-provider-runtime-manifest-v1`:
 }
 ```
 
-The provider revision must be an exact 40-character lowercase commit SHA.
+The provider revision must be an exact 40-character lowercase commit SHA and
+must match the provider checkout's normalized `origin` repository and `HEAD`.
 Provider file paths are repository-relative, unique, and may not be absolute,
-contain `..`, or use unsupported modes. Every listed file's mode and SHA-256
-are verified before provider paths are excluded from consumer clean-tree or
-candidate calculations. The manifest identity is captured at `init` and every
+contain `..`, or use unsupported modes. Each path is canonically resolved and
+must remain beneath `--provider-runtime-root`, preventing parent-directory
+symlink escapes. The manifest must include the executed
+`scripts/agent_workflow.py` entry point and its required
+`scripts/workflow_supervisor.py` module; both are mode- and SHA-256-verified.
+
+Every verification occurs before consumer workflow state progresses. Explicit
+external-runtime paths are physically outside the consumer worktree, so they
+are not excluded by name from consumer clean-tree, candidate, commit, or
+validation calculations. The manifest identity is captured at `init` and every
 later state read requires the same identity. Missing, malformed, relocated,
-changed, or tampered provider inputs fail closed; provider paths are not an
-authorization or candidate-scope bypass.
+changed, symlink-escaping, or tampered provider inputs fail closed; provider
+paths are not an authorization or candidate-scope bypass. The legacy
+`FIDENAUT_PROVIDER_RUNTIME_MANIFEST` environment-variable contract remains
+available only for ordinary in-repository compatibility invocation and cannot
+be combined with `--provider-manifest`.
 
 The transition journals are created only after each gate's existing
 preconditions pass and after the exact local acknowledgment is accepted, but

@@ -11,6 +11,7 @@ import os
 import pathlib
 import re
 import shlex
+import subprocess
 import tempfile
 import time
 import uuid
@@ -725,7 +726,15 @@ def _github_command(config, *parts):
 
 
 def _provider_runtime_manifest_path(root, config):
-    supplied = os.environ.get(PROVIDER_RUNTIME_MANIFEST_ENV)
+    supplied = config.get("_provider_manifest")
+    environment_supplied = os.environ.get(PROVIDER_RUNTIME_MANIFEST_ENV)
+    _ensure(
+        not (supplied and environment_supplied),
+        "ambiguous-provider-runtime-manifest",
+        "--provider-manifest and %s cannot both be set"
+        % PROVIDER_RUNTIME_MANIFEST_ENV,
+    )
+    supplied = supplied or environment_supplied
     if not supplied:
         return None
     path = pathlib.Path(supplied).expanduser()
@@ -758,8 +767,18 @@ def _validate_provider_runtime_path(path, context):
     return path
 
 
-def _provider_file_identity(root, path, context):
-    full_path = root / path
+def _provider_file_identity(root, config, path, context):
+    runtime_root = config.get("_provider_runtime_root", root).resolve()
+    full_path = runtime_root / path
+    resolved_path = full_path.resolve()
+    try:
+        resolved_path.relative_to(runtime_root)
+    except ValueError:
+        _raise(
+            "provider-runtime-integrity-mismatch",
+            "%s provider file resolves outside the provider runtime: %s"
+            % (context, path),
+        )
     try:
         if full_path.is_symlink():
             mode = "120000"
@@ -775,6 +794,47 @@ def _provider_file_identity(root, path, context):
     return {"path": path, "mode": mode, "sha256": hashlib.sha256(data).hexdigest()}
 
 
+def _provider_checkout_identity(runtime_root, provider):
+    """Require an external runtime checkout to match the declared provider pin."""
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=runtime_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+        remote = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=runtime_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        _raise(
+            "provider-runtime-integrity-mismatch",
+            "provider runtime is not a verifiable Git checkout: %s" % error,
+        )
+
+    def normalize_repository(value):
+        value = value.strip().removesuffix(".git")
+        if value.startswith("git@github.com:"):
+            return "github.com/" + value.split(":", 1)[1]
+        if value.startswith(("https://", "http://", "ssh://")):
+            value = re.sub(r"^[a-z]+://(?:[^@/]+@)?", "", value)
+        return value.strip("/")
+
+    _ensure(
+        revision == provider["revision"]
+        and normalize_repository(remote) == normalize_repository(provider["repository"]),
+        "provider-runtime-integrity-mismatch",
+        "provider runtime checkout does not match the verified repository and revision",
+    )
+
+
 def _provider_runtime_identity(root, config):
     manifest_path = _provider_runtime_manifest_path(root, config)
     if manifest_path is None:
@@ -788,11 +848,21 @@ def _provider_runtime_identity(root, config):
     provider = manifest.get("provider")
     _ensure(
         isinstance(provider, dict)
+        and isinstance(provider.get("repository"), str)
+        and provider["repository"]
         and isinstance(provider.get("revision"), str)
         and re.fullmatch(r"[0-9a-f]{40}", provider["revision"]),
         "invalid-provider-runtime-manifest",
         "provider runtime manifest requires a verified provider revision",
     )
+    runtime_root = config.get("_provider_runtime_root", root)
+    _ensure(
+        runtime_root.is_dir(),
+        "provider-runtime-integrity-mismatch",
+        "provider runtime root is missing or not a directory: %s" % runtime_root,
+    )
+    if config.get("_provider_runtime_explicit"):
+        _provider_checkout_identity(runtime_root, provider)
     files = manifest.get("files")
     _ensure(
         isinstance(files, list) and files,
@@ -823,7 +893,7 @@ def _provider_runtime_identity(root, config):
             "invalid-provider-runtime-manifest",
             "provider runtime identity is invalid for %s" % path,
         )
-        actual = _provider_file_identity(root, path, "provider runtime manifest")
+        actual = _provider_file_identity(root, config, path, "provider runtime manifest")
         _ensure(
             actual == {"path": path, "mode": mode, "sha256": digest},
             "provider-runtime-integrity-mismatch",
@@ -831,6 +901,13 @@ def _provider_runtime_identity(root, config):
         )
         normalized.append(actual)
     normalized.sort(key=lambda item: item["path"])
+    required_paths = config.get("_required_provider_runtime_paths", set())
+    _ensure(
+        required_paths.issubset(seen),
+        "provider-runtime-integrity-mismatch",
+        "provider runtime manifest is missing required executed files: %s"
+        % ", ".join(sorted(required_paths - seen)),
+    )
     identity = {
         "format": PROVIDER_RUNTIME_MANIFEST_FORMAT,
         "provider": {
@@ -846,6 +923,8 @@ def _provider_runtime_identity(root, config):
 
 def _provider_runtime_paths(root, config):
     identity = _provider_runtime_identity(root, config)
+    if config.get("_provider_runtime_explicit"):
+        return set()
     return {item["path"] for item in identity["files"]} if identity else set()
 
 
@@ -10364,7 +10443,10 @@ def _add_issue(parser):
 
 
 def _add_root(parser):
-    parser.add_argument("--root", default=".")
+    parser.add_argument("--root")
+    parser.add_argument("--consumer-root")
+    parser.add_argument("--provider-runtime-root")
+    parser.add_argument("--provider-manifest")
 
 
 def _add_artifact(parser):
@@ -10660,10 +10742,48 @@ COMMANDS = {
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    root = pathlib.Path(args.root).resolve()
+    root = pathlib.Path(args.consumer_root or args.root or ".").resolve()
 
     try:
+        _ensure(
+            not (args.root and args.consumer_root),
+            "ambiguous-consumer-root",
+            "--root and --consumer-root cannot both be set",
+        )
         config = _load_config(root)
+        runtime_root = pathlib.Path(args.provider_runtime_root or root).expanduser().resolve()
+        if args.provider_runtime_root:
+            _ensure(
+                args.provider_manifest,
+                "missing-provider-runtime-manifest",
+                "--provider-runtime-root requires --provider-manifest",
+            )
+            source = pathlib.Path(__file__).resolve()
+            try:
+                source.relative_to(runtime_root)
+            except ValueError:
+                _raise(
+                    "provider-runtime-execution-mismatch",
+                    "external provider invocation must execute code from --provider-runtime-root",
+                )
+            required_paths = set()
+            for module_path in (
+                source,
+                pathlib.Path(workflow_supervisor.__file__).resolve(),
+            ):
+                try:
+                    required_paths.add(
+                        module_path.relative_to(runtime_root).as_posix()
+                    )
+                except ValueError:
+                    _raise(
+                        "provider-runtime-execution-mismatch",
+                        "external provider invocation imports code outside --provider-runtime-root",
+                    )
+            config["_required_provider_runtime_paths"] = required_paths
+        config["_provider_runtime_root"] = runtime_root
+        config["_provider_runtime_explicit"] = bool(args.provider_runtime_root)
+        config["_provider_manifest"] = args.provider_manifest
         payload = COMMANDS[args.command](args, root, config)
         _emit(payload)
         return 0
