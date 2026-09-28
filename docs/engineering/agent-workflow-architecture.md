@@ -190,3 +190,11 @@ Scope, ancestry, test-boundary, content-identity, cleanliness, and topology
 violations fail closed. This is a governance and integrity boundary, not a
 claim that the local acknowledgment mechanism authenticates a person or
 replaces GitHub review, CI, or human-controlled merging.
+
+For each plan, test report, and implementation report, the workflow also
+compares the producer and corresponding reviewer `COPILOT_AGENT_SESSION_ID`
+observations and rejects an exact match when both are present. A differing or
+unavailable value is recorded only as an `independent_review_signal`; it does
+not prove independent execution. This value is unauthenticated and may be
+deliberately forged or manipulated. Reused artifacts retain their original
+observations across governed revisions.

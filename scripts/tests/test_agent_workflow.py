@@ -259,6 +259,450 @@ class AgentWorkflowTest(unittest.TestCase):
         payload = json.loads(output.getvalue())
         return code, payload, error.getvalue()
 
+    def run_cli_with_session(self, session_id, *arguments):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("COPILOT_AGENT_SESSION_ID", None)
+            if session_id is not None:
+                os.environ["COPILOT_AGENT_SESSION_ID"] = session_id
+            return self.run_cli(*arguments)
+
+    def test_issue_7_plan_review_rejects_same_session_before_overwriting_artifact(self):
+        self.write_artifact("plan.md", "initial plan")
+        self.write_artifact("plan-review.md", "initial review")
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        self.assertEqual(
+            0,
+            self.run_cli_with_session(
+                "",
+                "submit-plan",
+                str(ISSUE),
+                "--artifact",
+                "artifacts-src/plan.md",
+                "--agent",
+                "chess-echo-planner",
+                "--scope",
+                "src/Example.kt",
+            )[0],
+        )
+        self.assertEqual(
+            0,
+            self.run_cli_with_session(
+                " ",
+                "review-plan",
+                str(ISSUE),
+                "--status",
+                workflow.REVISION,
+                "--artifact",
+                "artifacts-src/plan-review.md",
+                "--reviewer",
+                "chess-echo-reviewer",
+            )[0],
+        )
+        review_artifact = self.state()["artifacts"]["plan_review"]
+        review_path = self.root / review_artifact["path"]
+        previous_review = review_path.read_bytes()
+
+        self.write_artifact("plan.md", "revised plan")
+        self.assertEqual(
+            0,
+            self.run_cli_with_session(
+                "same-session",
+                "submit-plan",
+                str(ISSUE),
+                "--artifact",
+                "artifacts-src/plan.md",
+                "--agent",
+                "chess-echo-planner",
+                "--scope",
+                "src/Example.kt",
+            )[0],
+        )
+        state_before_review = self.state()
+        code, payload, _ = self.run_cli_with_session(
+            "same-session",
+            "review-plan",
+            str(ISSUE),
+            "--status",
+            workflow.READY,
+            "--artifact",
+            "artifacts-src/plan-review.md",
+            "--reviewer",
+            "chess-echo-reviewer",
+        )
+        self.assertEqual(1, code, "same-session plan review must be rejected")
+        self.assertEqual("review-session-collision", payload["error"]["code"])
+        self.assertEqual(state_before_review, self.state())
+        self.assertEqual(previous_review, review_path.read_bytes())
+        plan_artifact = self.state()["artifacts"]["plan"]
+        self.assertEqual(
+            {"available": True, "value": "same-session"},
+            plan_artifact["observed_session_context"],
+        )
+        review_artifact = self.state()["artifacts"]["plan_review"]
+        self.assertEqual(
+            {"available": True, "value": " "},
+            review_artifact["observed_session_context"],
+        )
+        self.assertEqual("contexts-differed", review_artifact["independent_review_signal"])
+
+    def test_issue_7_test_review_rejects_same_session_without_advancing_state(self):
+        self.bootstrap_to_test_implementation()
+        (self.root / "src" / "test").mkdir(parents=True, exist_ok=True)
+        (self.root / "src" / "test" / "ExampleTest.kt").write_text(
+            "test\n", encoding="utf-8"
+        )
+        self.git("add", "src/test/ExampleTest.kt")
+        self.git("commit", "-qm", "candidate tests")
+        self.write_artifact("test-report.md", "tests")
+        self.write_artifact("test-review.md", "review")
+        self.assertEqual(
+            0,
+            self.run_cli_with_session(
+                "same-session",
+                "submit-tests",
+                str(ISSUE),
+                "--artifact",
+                "artifacts-src/test-report.md",
+                "--agent",
+                "chess-echo-test-implementer",
+                "--failure-command",
+                "%s -c \"print('expected failure'); import sys; sys.exit(1)\"" % sys.executable,
+                "--failure-contains",
+                "expected failure",
+            )[0],
+        )
+        state_before_review = self.state()
+        canonical_review_path = (
+            self.root
+            / ".agent-workflow"
+            / "runs"
+            / f"issue-{ISSUE}"
+            / "artifacts"
+            / "test-review.md"
+        )
+        canonical_review_path.write_text("previous test review\n", encoding="utf-8")
+        code, payload, _ = self.run_cli_with_session(
+            "same-session",
+            "review-tests",
+            str(ISSUE),
+            "--status",
+            workflow.READY,
+            "--artifact",
+            "artifacts-src/test-review.md",
+            "--reviewer",
+            "chess-echo-reviewer",
+        )
+        self.assertEqual(1, code, "same-session test review must be rejected")
+        self.assertEqual("review-session-collision", payload["error"]["code"])
+        self.assertEqual(state_before_review, self.state())
+        self.assertNotIn("test_review", self.state()["artifacts"])
+        self.assertEqual(
+            "previous test review\n",
+            canonical_review_path.read_text(encoding="utf-8"),
+        )
+        report = self.state()["artifacts"]["test_report"]
+        self.assertEqual(
+            {"available": True, "value": "same-session"},
+            report["observed_session_context"],
+        )
+
+        code, payload, _ = self.run_cli_with_session(
+            None,
+            "review-tests",
+            str(ISSUE),
+            "--status",
+            workflow.READY,
+            "--artifact",
+            "artifacts-src/test-review.md",
+            "--reviewer",
+            "chess-echo-reviewer",
+        )
+        self.assertEqual(0, code)
+        review = self.state()["artifacts"]["test_review"]
+        self.assertEqual(
+            {"available": False, "value": None},
+            review["observed_session_context"],
+        )
+        self.assertEqual("unavailable", review["independent_review_signal"])
+
+    def test_issue_7_not_applicable_test_report_records_and_compares_context(self):
+        self.write_artifact("plan.md", "plan")
+        self.write_artifact("plan-review.md", "plan review")
+        self.write_artifact("test-report.md", "not applicable")
+        self.write_artifact("test-review.md", "test review")
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        self.assertEqual(
+            0,
+            self.run_cli(
+                "submit-plan",
+                str(ISSUE),
+                "--artifact",
+                "artifacts-src/plan.md",
+                "--agent",
+                "chess-echo-planner",
+                "--scope",
+                "docs/example.md",
+            )[0],
+        )
+        self.assertEqual(
+            0,
+            self.run_cli(
+                "review-plan",
+                str(ISSUE),
+                "--status",
+                workflow.READY,
+                "--artifact",
+                "artifacts-src/plan-review.md",
+                "--reviewer",
+                "chess-echo-reviewer",
+            )[0],
+        )
+        self.assertEqual(
+            0,
+            self.run_cli(
+                "approve-plan",
+                str(ISSUE),
+                "--by",
+                "owner",
+                "--confirm",
+                "plan_approved",
+            )[0],
+        )
+        self.assertEqual(
+            0,
+            self.run_cli_with_session(
+                "",
+                "submit-tests",
+                str(ISSUE),
+                "--artifact",
+                "artifacts-src/test-report.md",
+                "--agent",
+                "chess-echo-test-implementer",
+                "--not-applicable",
+                "--reason",
+                "Approved scope does not change executable behavior.",
+            )[0],
+        )
+        report = self.state()["artifacts"]["test_report"]
+        self.assertEqual("NOT_APPLICABLE", self.state()["test_implementation_status"])
+        self.assertEqual(
+            {"available": True, "value": ""},
+            report["observed_session_context"],
+        )
+        canonical_review_path = (
+            self.root
+            / ".agent-workflow"
+            / "runs"
+            / f"issue-{ISSUE}"
+            / "artifacts"
+            / "test-review.md"
+        )
+        canonical_review_path.write_text(
+            "previous not-applicable review\n", encoding="utf-8"
+        )
+        code, payload, _ = self.run_cli_with_session(
+            "",
+            "review-tests",
+            str(ISSUE),
+            "--status",
+            workflow.READY,
+            "--artifact",
+            "artifacts-src/test-review.md",
+            "--reviewer",
+            "chess-echo-reviewer",
+        )
+        self.assertEqual(1, code)
+        self.assertEqual("review-session-collision", payload["error"]["code"])
+        self.assertNotIn("test_review", self.state()["artifacts"])
+        self.assertEqual(
+            "previous not-applicable review\n",
+            canonical_review_path.read_text(encoding="utf-8"),
+        )
+
+    def test_issue_7_unset_producer_and_present_empty_reviewer_is_unavailable(self):
+        self.write_artifact("plan.md", "plan")
+        self.write_artifact("plan-review.md", "review")
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        self.assertEqual(
+            0,
+            self.run_cli_with_session(
+                None,
+                "submit-plan",
+                str(ISSUE),
+                "--artifact",
+                "artifacts-src/plan.md",
+                "--agent",
+                "chess-echo-planner",
+                "--scope",
+                "src/Example.kt",
+            )[0],
+        )
+        producer = self.state()["artifacts"]["plan"]
+        self.assertEqual(
+            {"available": False, "value": None},
+            producer["observed_session_context"],
+        )
+        self.assertEqual(
+            0,
+            self.run_cli_with_session(
+                "",
+                "review-plan",
+                str(ISSUE),
+                "--status",
+                workflow.READY,
+                "--artifact",
+                "artifacts-src/plan-review.md",
+                "--reviewer",
+                "chess-echo-reviewer",
+            )[0],
+        )
+        reviewer = self.state()["artifacts"]["plan_review"]
+        self.assertEqual(
+            {"available": True, "value": ""},
+            reviewer["observed_session_context"],
+        )
+        self.assertEqual("unavailable", reviewer["independent_review_signal"])
+
+    def test_issue_7_empty_session_values_collide_and_role_validation_is_independent(self):
+        self.write_artifact("plan.md", "plan")
+        self.write_artifact("plan-review.md", "review")
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        self.assertEqual(
+            0,
+            self.run_cli_with_session(
+                "",
+                "submit-plan",
+                str(ISSUE),
+                "--artifact",
+                "artifacts-src/plan.md",
+                "--agent",
+                "chess-echo-planner",
+                "--scope",
+                "src/Example.kt",
+            )[0],
+        )
+        code, payload, _ = self.run_cli_with_session(
+            "",
+            "review-plan",
+            str(ISSUE),
+            "--status",
+            workflow.READY,
+            "--artifact",
+            "artifacts-src/plan-review.md",
+            "--reviewer",
+            "not-the-reviewer-role",
+        )
+        self.assertEqual(1, code)
+        self.assertEqual("role-mismatch", payload["error"]["code"])
+        self.assertNotIn("plan_review", self.state()["artifacts"])
+        code, payload, _ = self.run_cli_with_session(
+            "",
+            "review-plan",
+            str(ISSUE),
+            "--status",
+            workflow.READY,
+            "--artifact",
+            "artifacts-src/plan-review.md",
+            "--reviewer",
+            "chess-echo-reviewer",
+        )
+        self.assertEqual(1, code)
+        self.assertEqual("review-session-collision", payload["error"]["code"])
+        self.assertNotIn("plan_review", self.state()["artifacts"])
+
+    def test_issue_7_implementation_review_rejects_same_session_and_accepts_difference(self):
+        self.bootstrap_to_implementation()
+        (self.root / "src" / "Example.kt").parent.mkdir(parents=True, exist_ok=True)
+        (self.root / "src" / "Example.kt").write_text(
+            "implementation\n", encoding="utf-8"
+        )
+        evidence_path = self.write_evidence()
+        self.assertEqual(
+            0,
+            self.run_cli_with_session(
+                "implementation-session",
+                "submit-implementation",
+                str(ISSUE),
+                "--artifact",
+                "artifacts-src/implementation-report.md",
+                "--agent",
+                "chess-echo-implementer",
+                "--evidence",
+                evidence_path,
+            )[0],
+        )
+        self.assertEqual(
+            0,
+            self.run_cli(
+                "run-validation",
+                str(ISSUE),
+                "--profile",
+                "workflow-tooling",
+            )[0],
+        )
+        self.write_artifact("implementation-review.md", "review")
+        state_before_review = self.state()
+        canonical_review_path = (
+            self.root
+            / ".agent-workflow"
+            / "runs"
+            / f"issue-{ISSUE}"
+            / "artifacts"
+            / "implementation-review.md"
+        )
+        canonical_review_path.write_text(
+            "previous implementation review\n", encoding="utf-8"
+        )
+        code, payload, _ = self.run_cli_with_session(
+            "implementation-session",
+            "review-implementation",
+            str(ISSUE),
+            "--status",
+            workflow.READY,
+            "--artifact",
+            "artifacts-src/implementation-review.md",
+            "--reviewer",
+            "chess-echo-reviewer",
+        )
+        self.assertEqual(1, code, "same-session implementation review must be rejected")
+        self.assertEqual("review-session-collision", payload["error"]["code"])
+        self.assertEqual(state_before_review, self.state())
+        self.assertNotIn("implementation_review", self.state()["artifacts"])
+        self.assertEqual(
+            "previous implementation review\n",
+            canonical_review_path.read_text(encoding="utf-8"),
+        )
+        report = self.state()["artifacts"]["implementation_report"]
+        self.assertEqual(
+            {"available": True, "value": "implementation-session"},
+            report["observed_session_context"],
+        )
+
+        self.assertEqual(
+            0,
+            self.run_cli_with_session(
+                "different-session",
+                "review-implementation",
+                str(ISSUE),
+                "--status",
+                workflow.READY,
+                "--artifact",
+                "artifacts-src/implementation-review.md",
+                "--reviewer",
+                "chess-echo-reviewer",
+            )[0],
+        )
+        review = self.state()["artifacts"]["implementation_review"]
+        self.assertEqual(
+            {"available": True, "value": "different-session"},
+            review["observed_session_context"],
+        )
+        self.assertEqual("contexts-differed", review["independent_review_signal"])
+        self.assertEqual(
+            "WAITING_FOR_IMPLEMENTATION_HUMAN_APPROVAL",
+            self.state()["status"],
+        )
+
     def write_artifact(self, name, content):
         path = self.root / "artifacts-src" / name
         path.write_text(content, encoding="utf-8")
@@ -7996,6 +8440,57 @@ class RevisionAndPrRevisionTest(AgentWorkflowTest):
         source = inspect.getsource(workflow.command_reconcile_historical_legacy_draft_pr)
         self.assertIn("_repository_identities_match", source)
         self.assertIn("remote", source)
+
+    def test_issue_7_revision_copy_preserves_original_observed_artifact_contexts(self):
+        parent_state = self.bootstrap_completed_parent(self.PARENT_ISSUE)
+        original_contexts = {
+            "plan": {"available": True, "value": "original-planner-context"},
+            "plan_review": {
+                "observed_session_context": {
+                    "available": True,
+                    "value": "original-plan-reviewer-context",
+                },
+                "independent_review_signal": "contexts-differed",
+            },
+            "test_report": {"available": True, "value": "original-test-context"},
+            "test_review": {
+                "observed_session_context": {
+                    "available": True,
+                    "value": "original-test-reviewer-context",
+                },
+                "independent_review_signal": "unavailable",
+            },
+        }
+        for kind, metadata in original_contexts.items():
+            if kind.endswith("_review"):
+                parent_state["artifacts"][kind].update(metadata)
+            else:
+                parent_state["artifacts"][kind]["observed_session_context"] = metadata
+        self.write_state_for(self.PARENT_ISSUE, parent_state)
+
+        code, payload, _ = self.run_cli_with_session(
+            "copying-execution-context",
+            "start-revision",
+            str(self.CHILD_ISSUE),
+            "--parent-issue",
+            str(self.PARENT_ISSUE),
+            "--class",
+            "implementation",
+            "--by",
+            "tester",
+        )
+        self.assertEqual(0, code)
+        self.assertEqual("IMPLEMENTATION", payload["status"])
+        child_state = self.state_for(self.CHILD_ISSUE)
+        for kind, metadata in original_contexts.items():
+            if kind.endswith("_review"):
+                for key, value in metadata.items():
+                    self.assertEqual(value, child_state["artifacts"][kind][key])
+            else:
+                self.assertEqual(
+                    metadata,
+                    child_state["artifacts"][kind]["observed_session_context"],
+                )
 
     def test_reconciliation_replay_has_explicit_finalized_noop_path(self):
         source = inspect.getsource(workflow.command_reconcile_historical_legacy_draft_pr)
