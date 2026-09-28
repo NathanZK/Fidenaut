@@ -266,6 +266,243 @@ class AgentWorkflowTest(unittest.TestCase):
                 os.environ["COPILOT_AGENT_SESSION_ID"] = session_id
             return self.run_cli(*arguments)
 
+    def enable_role_execution(self):
+        path = self.root / ".github" / "agent-workflow.json"
+        config = json.loads(path.read_text())
+        config["workflow"]["role_execution_contexts"] = True
+        path.write_text(json.dumps(config, indent=2) + "\n")
+        self.git("add", ".github/agent-workflow.json")
+        self.git("commit", "-qm", "Enable managed role execution in fixture")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+    def execute_role_artifact(self, role, name, content, changed_path=None):
+        source = (
+            "import json, os, pathlib, sys; "
+            "inputs=json.loads(os.environ['FIDENAUT_CANONICAL_INPUTS']); "
+            "text=''.join(pathlib.Path(item['path']).read_text() for item in inputs); "
+            "pathlib.Path(sys.argv[1]).write_text(sys.argv[2]+text); "
+            "changed=sys.argv[3]; "
+            "pathlib.Path(changed).parent.mkdir(parents=True, exist_ok=True) if changed != '-' else None; "
+            "pathlib.Path(changed).write_text(sys.argv[2]+text) if changed != '-' else None"
+        )
+        output = "artifacts-src/" + name
+        code, result, _ = self.run_cli(
+            "run-role", str(ISSUE), "--agent", "chess-echo-" + role.replace("_", "-"),
+            "--output", output, "--command",
+            json.dumps([sys.executable, "-c", source, output, content, changed_path or "-"]),
+            *([] if changed_path is None else ["--changed-path", changed_path]),
+        )
+        self.assertEqual(0, code, result)
+        receipt = result["receipt"]
+        binding = self.state()["role_contexts"][role]
+        self.assertEqual(binding["instance_id"], receipt["instance_id"])
+        self.assertEqual(binding["process_group"], receipt["worker_pid"])
+        self.assertEqual(binding["process_group"], receipt["work"]["process_group"])
+        self.assertEqual(0, receipt["work"]["exit_code"])
+        history = json.loads(pathlib.Path(binding["history_path"]).read_text())
+        self.assertEqual(receipt["history_length"], len(history))
+        self.assertEqual(receipt["work"], history[-1]["work"])
+        return output, receipt
+
+    def test_managed_role_plan_handoff_and_repeated_revisions_use_canonical_artifacts(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        plan, first = self.execute_role_artifact("planner", "plan.md", "plan-1 ")
+        self.assertEqual(0, self.run_cli_with_session("planner-session",
+            "submit-plan", str(ISSUE), "--artifact", plan, "--agent",
+            "chess-echo-planner", "--scope", "src/Example.kt",
+        )[0])
+        first_identity = dict(self.state()["artifacts"]["plan"])
+        ids = {}
+        for cycle in range(2):
+            review, reviewed = self.execute_role_artifact(
+                "reviewer", "plan-review.md", "findings-%d " % cycle
+            )
+            canonical = self.state()["artifacts"]["plan"]
+            self.assertEqual(canonical["sha256"], reviewed["inputs"][0]["sha256"])
+            self.assertEqual(str((self.root / canonical["path"]).resolve()), reviewed["inputs"][0]["path"])
+            code, result, _ = self.run_cli_with_session("reviewer-session",
+                "review-plan", str(ISSUE), "--status", workflow.REVISION,
+                "--artifact", review, "--reviewer", "chess-echo-reviewer",
+            )
+            self.assertEqual(0, code, result)
+            findings = self.state()["artifacts"]["plan_review"]
+            plan, revised = self.execute_role_artifact(
+                "planner", "plan.md", "plan-%d " % (cycle + 2)
+            )
+            self.assertEqual(findings["sha256"], revised["inputs"][0]["sha256"])
+            self.assertEqual(0, self.run_cli_with_session("planner-session",
+                "submit-plan", str(ISSUE), "--artifact", plan,
+                "--agent", "chess-echo-planner", "--scope", "src/Example.kt",
+            )[0])
+            self.assertEqual(first["instance_id"], revised["instance_id"])
+            self.assertEqual(cycle + 2, revised["history_length"])
+            self.assertEqual(cycle + 1, reviewed["history_length"])
+            ids["reviewer"] = reviewed["instance_id"]
+            self.assertNotEqual(first["instance_id"], ids["reviewer"])
+        self.assertEqual("plan-3 findings-1 plan-2 findings-0 plan-1 ",
+                         (self.root / self.state()["artifacts"]["plan"]["path"]).read_text())
+        self.assertEqual(first_identity["source"], self.state()["artifacts"]["plan"]["source"])
+        self.assertEqual(first_identity["kind"], self.state()["artifacts"]["plan"]["kind"])
+        self.assertEqual(first_identity["path"], self.state()["artifacts"]["plan"]["path"])
+        self.assertEqual(
+            hashlib.sha256((self.root / self.state()["artifacts"]["plan"]["path"]).read_bytes()).hexdigest(),
+            self.state()["artifacts"]["plan"]["sha256"],
+        )
+        self.assertEqual(
+            {p.name for p in (self.root / ".agent-workflow" / "runs" / f"issue-{ISSUE}" / "contexts").iterdir()},
+            {self.state()["role_contexts"]["planner"]["instance_id"] + ".history.json",
+             self.state()["role_contexts"]["reviewer"]["instance_id"] + ".history.json"},
+        )
+
+    def test_managed_role_recovery_rejects_aliases_and_preserves_replacement_lineage(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        self.execute_role_artifact("planner", "plan.md", "first")
+        state = self.state()
+        original = state["role_contexts"]["planner"]
+        runtime = workflow.workflow_supervisor.ManagedExecutionRuntime(
+            self.root / ".agent-workflow" / "runs" / f"issue-{ISSUE}" / "contexts"
+        )
+        runtime.stop(original)
+        code, failure, _ = self.run_cli(
+            "run-role", str(ISSUE), "--agent", "chess-echo-planner",
+            "--output", "artifacts-src/plan.md", "--command",
+            json.dumps([sys.executable, "-c", "print('unreachable')"]),
+        )
+        self.assertEqual(1, code)
+        self.assertEqual(state, self.state())
+        code, replacement, _ = self.run_cli(
+            "replace-role-context", str(ISSUE), "--role", "planner", "--by", "operator",
+        )
+        self.assertEqual(0, code, replacement)
+        self.assertNotEqual(original["instance_id"], replacement["replacement"]["instance_id"])
+        self.assertEqual(original["instance_id"], replacement["replacement"]["replaces"])
+        self.assertEqual(original["instance_id"], self.state()["role_context_replacements"][0]["original"])
+        self.execute_role_artifact("planner", "plan.md", "replacement")
+        self.assertEqual(1, self.state()["role_work"]["plan"]["receipt"]["history_length"])
+
+    def test_managed_role_rejects_distinct_bindings_to_one_worker(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        plan, _ = self.execute_role_artifact("planner", "plan.md", "plan")
+        self.assertEqual(0, self.run_cli_with_session(
+            "planner-session", "submit-plan", str(ISSUE), "--artifact", plan,
+            "--agent", "chess-echo-planner", "--scope", "src/Example.kt",
+        )[0])
+        state = self.state()
+        original = state["role_contexts"]["planner"]
+        alias = dict(original, instance_id="different-binding", role="reviewer")
+        state["role_contexts"]["reviewer"] = alias
+        self.write_state(state)
+        code, failure, _ = self.run_cli(
+            "run-role", str(ISSUE), "--agent", "chess-echo-reviewer",
+            "--output", "artifacts-src/plan-review.md",
+            "--command", json.dumps([sys.executable, "-c", "print('should not run')"]),
+        )
+        self.assertEqual(1, code)
+        self.assertEqual("role-context-unavailable", failure["error"]["code"])
+        self.assertEqual(state, self.state())
+        self.assertFalse((self.root / "artifacts-src" / "plan-review.md").exists())
+
+    def test_managed_four_roles_execute_test_and_implementation_revisions(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        plan, _ = self.execute_role_artifact("planner", "plan.md", "plan")
+        self.assertEqual(0, self.run_cli_with_session(
+            "planner-session", "submit-plan", str(ISSUE), "--artifact", plan,
+            "--agent", "chess-echo-planner", "--scope", "src/test/ExampleTest.kt",
+            "--scope", "src/Example.kt",
+        )[0])
+        plan_review, _ = self.execute_role_artifact("reviewer", "plan-review.md", "review")
+        self.assertEqual(0, self.run_cli_with_session(
+            "reviewer-session", "review-plan", str(ISSUE), "--status", workflow.READY,
+            "--artifact", plan_review, "--reviewer", "chess-echo-reviewer",
+        )[0])
+        self.assertEqual(0, self.run_cli(
+            "approve-plan", str(ISSUE), "--by", "owner", "--confirm", "plan_approved",
+        )[0])
+        reviewer_id = self.state()["role_contexts"]["reviewer"]["instance_id"]
+
+        for cycle in range(2):
+            test_report, produced = self.execute_role_artifact(
+                "test_implementer", "test-report.md", "tests-%d " % cycle,
+                "src/test/ExampleTest.kt",
+            )
+            if cycle:
+                self.assertEqual(test_id, produced["instance_id"])
+                self.assertEqual(2, produced["history_length"])
+                self.assertEqual(
+                    self.state()["artifacts"]["test_review"]["sha256"],
+                    produced["inputs"][0]["sha256"],
+                )
+            test_id = produced["instance_id"]
+            self.git("add", "src/test/ExampleTest.kt")
+            self.git("commit", "-qm", "candidate tests revision %d" % cycle)
+            code, result, _ = self.run_cli_with_session(
+                "test-producer-session", "submit-tests", str(ISSUE),
+                "--artifact", test_report, "--agent", "chess-echo-test-implementer",
+                "--failure-command", "%s -c \"print('expected failure'); import sys; sys.exit(1)\"" % sys.executable,
+                "--failure-contains", "expected failure",
+            )
+            self.assertEqual(0, code, result)
+            review, reviewed = self.execute_role_artifact(
+                "reviewer", "test-review.md", "test-findings-%d " % cycle,
+            )
+            self.assertEqual(reviewer_id, reviewed["instance_id"])
+            self.assertEqual(self.state()["artifacts"]["test_report"]["sha256"],
+                             reviewed["inputs"][0]["sha256"])
+            code, result, _ = self.run_cli_with_session(
+                "reviewer-session", "review-tests", str(ISSUE),
+                "--status", workflow.REVISION if cycle == 0 else workflow.READY,
+                "--artifact", review, "--reviewer", "chess-echo-reviewer",
+            )
+            self.assertEqual(0, code, result)
+        self.assertEqual(0, self.approve_tests()[0])
+
+        for cycle in range(2):
+            report, produced = self.execute_role_artifact(
+                "implementer", "implementation-report.md", "implementation-%d " % cycle,
+                "src/Example.kt",
+            )
+            if cycle:
+                self.assertEqual(implementation_id, produced["instance_id"])
+                self.assertEqual(2, produced["history_length"])
+                self.assertEqual(
+                    self.state()["artifacts"]["implementation_review"]["sha256"],
+                    produced["inputs"][0]["sha256"],
+                )
+            implementation_id = produced["instance_id"]
+            evidence = self.write_evidence()
+            code, result, _ = self.run_cli_with_session(
+                "implementation-producer-session", "submit-implementation", str(ISSUE),
+                "--artifact", report, "--agent", "chess-echo-implementer",
+                "--evidence", evidence,
+            )
+            self.assertEqual(0, code, result)
+            self.assertEqual(0, self.run_cli(
+                "run-validation", str(ISSUE), "--profile", "workflow-tooling",
+            )[0])
+            review, reviewed = self.execute_role_artifact(
+                "reviewer", "implementation-review.md", "implementation-findings-%d " % cycle,
+            )
+            self.assertEqual(reviewer_id, reviewed["instance_id"])
+            self.assertEqual(self.state()["artifacts"]["implementation_report"]["sha256"],
+                             reviewed["inputs"][0]["sha256"])
+            code, result, _ = self.run_cli_with_session(
+                "reviewer-session", "review-implementation", str(ISSUE),
+                "--status", workflow.REVISION if cycle == 0 else workflow.READY,
+                "--artifact", review, "--reviewer", "chess-echo-reviewer",
+            )
+            self.assertEqual(0, code, result)
+        contexts = self.state()["role_contexts"]
+        self.assertEqual(
+            4, len({contexts[role]["instance_id"] for role in (
+                "planner", "reviewer", "test_implementer", "implementer",
+            )}),
+        )
+        self.assertEqual("WAITING_FOR_IMPLEMENTATION_HUMAN_APPROVAL", self.state()["status"])
+
     def test_issue_7_plan_review_rejects_same_session_before_overwriting_artifact(self):
         self.write_artifact("plan.md", "initial plan")
         self.write_artifact("plan-review.md", "initial review")

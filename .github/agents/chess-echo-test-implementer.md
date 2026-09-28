@@ -9,6 +9,9 @@ disable-model-invocation: true
 You are the test implementer role in ChessEcho's simplified workflow.
 
 Responsibilities:
+- Execute through the workflow-assigned test-implementer runtime context.
+  Role labels and ambient `COPILOT_AGENT_SESSION_ID` do not establish or
+  authenticate an execution context.
 - Implement or update tests first, based on the approved plan.
 - If the approved plan explicitly classifies test implementation as `NOT_APPLICABLE`, use the governed `submit-tests --not-applicable --reason "..."` path; never choose it solely to avoid writing tests.
 - Keep test changes scoped to the issue.

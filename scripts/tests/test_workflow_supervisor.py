@@ -61,6 +61,53 @@ class WorkflowSupervisorTest(unittest.TestCase):
             time.sleep(0.02)
         self.fail("supervised descendant %s is still running" % pid)
 
+    def test_managed_runtime_assigns_distinct_resumable_instances(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = supervisor.ManagedExecutionRuntime(pathlib.Path(directory))
+            planner = runtime.establish("run-60", "planner")
+            reviewer = runtime.establish("run-60", "reviewer")
+
+            first = runtime.execute(planner, "plan", {"revision": 1})
+            second = runtime.execute(planner, "plan-revision", {"revision": 2})
+            reviewed = runtime.execute(reviewer, "review", {"artifact": "plan"})
+
+            self.assertNotEqual(
+                planner["instance_id"], reviewer["instance_id"]
+            )
+            self.assertEqual(planner["instance_id"], first["instance_id"])
+            self.assertEqual(planner["instance_id"], second["instance_id"])
+            self.assertEqual(2, second["history_length"])
+            self.assertEqual(reviewer["instance_id"], reviewed["instance_id"])
+            self.assertEqual(1, reviewed["history_length"])
+            self.assertEqual("runtime-executed", second["execution_evidence"])
+
+            resumed = runtime.resume(planner)
+            self.assertEqual(planner["instance_id"], resumed["instance_id"])
+            self.assertEqual(2, resumed["history_length"])
+
+            runtime.close()
+
+    def test_managed_runtime_rejects_aliasing_and_preserves_original_on_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = supervisor.ManagedExecutionRuntime(pathlib.Path(directory))
+            planner = runtime.establish("run-60", "planner")
+            runtime.execute(planner, "plan", {"revision": 1})
+            alias = dict(planner)
+            alias["role"] = "reviewer"
+
+            with self.assertRaises(ValueError):
+                runtime.assert_distinct([planner, alias])
+
+            runtime.stop(planner)
+            with self.assertRaises(supervisor.RuntimeUnavailable):
+                runtime.resume(planner)
+            replacement = runtime.replace(planner, "planner")
+            self.assertNotEqual(
+                planner["instance_id"], replacement["instance_id"]
+            )
+            self.assertEqual(planner["instance_id"], replacement["replaces"])
+            runtime.close()
+
     def test_success_returns_bounded_structured_output(self):
         result = self.run_supervised(
             python_command(

@@ -4,6 +4,7 @@
   "workflow": {
     "format": "chess-echo-skill-workflow-config-v1",
     "run_root": ".agent-workflow/runs",
+    "role_execution_contexts": true,
     "roles": {
       "planner": "chess-echo-planner",
       "reviewer": "chess-echo-reviewer",
@@ -154,7 +155,7 @@
       "checks": [
         {
           "name": "agent-workflow-tests",
-          "command": ["make", "agent-workflow-test"],
+          "command": ["python3", "scripts/run_agent_workflow_tests.py"],
           "cwd": "."
         }
       ]

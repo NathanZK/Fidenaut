@@ -1252,16 +1252,55 @@ revision's approvals, artifacts, validation evidence, or implementation
 state. Genuine test, implementation, and plan revisions remain governed by
 their own `start-revision` workflow and are not recoverable by this command.
 
+## Assigned role execution contexts
+
+When `workflow.role_execution_contexts` is enabled, role work is routed
+through the managed runtime boundary in `scripts/workflow_supervisor.py`.
+The controller owns the execution-scoped binding, but the actual instance is
+a runtime-owned long-lived POSIX process group with its own history journal
+and operation endpoint. The runtime establishes it on first role entry and
+resolves/resumes it on later entries.
+
+The controller accepts work only when the runtime returns evidence for the
+resolved instance. A binding string, role label, Python object, or
+`COPILOT_AGENT_SESSION_ID` observation is not assignment, execution proof, or
+authentication. Distinct role bindings must resolve to distinct instances.
+Recovery first attempts the original; an explicitly authorized replacement
+gets a new binding and lineage.
+
+Before `submit-plan`, `submit-tests`, or `submit-implementation` (and before
+each corresponding `review-*`), invoke `run-role ISSUE --agent ROLE
+--output PATH --command '["executable","argument",...]'`. The controller
+selects the role from the current workflow gate; it rejects a mismatched
+`--agent` and dispatches the command within that role's managed process
+group. `--changed-path APPROVED_PATH` may be repeated for test-implementer or
+implementer source edits; the runtime records their content digests alongside
+the output artifact. The next submission checks that the runtime-produced
+output and changed source still match. The command receives
+`FIDENAUT_CANONICAL_INPUTS`, a JSON list of verified paths and digests for
+the canonical producer artifact (for reviewers) or review findings (for a
+returning producer); it reads these files in the shared canonical store.
+When the original worker is unavailable, `run-role` fails explicitly.
+`replace-role-context ISSUE --role ROLE --by REQUESTER` is the explicit
+replacement decision at the current role gate; it records a distinct
+replacement binding and its original lineage.
+
+This does not create role-local artifacts. Producers and reviewers continue to
+use canonical artifact/evidence paths, preserving identity, provenance,
+digests, and issue #7 collision detection.
+
 ## Bounded execution
 
 All external commands run via `scripts/workflow_supervisor.py` with configured timeout, grace period, and output caps.
-Normal repository CI remains the broad validation authority; local checks are targeted to avoid reproducing CI.
+The complete configured Python workflow suite is the workflow-tooling gate; focused tests are useful during implementation but never replace governed validation.
 
 ## Commands
 
 ```bash
 python3 scripts/agent_workflow.py init ISSUE
 python3 scripts/agent_workflow.py status ISSUE
+python3 scripts/agent_workflow.py run-role ISSUE --agent ROLE --output PATH --command '["executable","argument",...]'
+python3 scripts/agent_workflow.py replace-role-context ISSUE --role ROLE --by REQUESTER
 python3 scripts/agent_workflow.py supersede-run ISSUE --by REQUESTER --reason "..." --confirm supersede_confirmed
 python3 scripts/agent_workflow.py submit-plan ISSUE --artifact PATH --agent chess-echo-planner
 python3 scripts/agent_workflow.py review-plan ISSUE --status READY_FOR_HUMAN_APPROVAL|NEEDS_REVISION --artifact PATH --reviewer chess-echo-reviewer

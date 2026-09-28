@@ -5,17 +5,215 @@ import base64
 import hashlib
 import json
 import os
+import pathlib
 import selectors
 import signal
+import socket
 import subprocess
+import sys
+import tempfile
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 
 
 RESULT_FORMAT = "chess-echo-process-result-v3"
 READ_SIZE = 64 * 1024
 POLL_INTERVAL_SECONDS = 0.01
+
+
+class RuntimeUnavailable(Exception):
+    """A previously assigned managed execution cannot be resumed."""
+
+
+class ManagedExecutionRuntime:
+    """Provider-neutral resumable role execution over supervised process groups.
+
+    Each instance owns a long-lived worker process and an append-only history
+    file written by that worker. The controller receives execution receipts
+    from the worker; handles and ambient environment values are never treated
+    as proof that work ran in the assigned instance.
+    """
+
+    _WORKER = (
+        "import hashlib, json, os, pathlib, socket, subprocess, sys\n"
+        "instance_id, state_path, endpoint = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3]\n"
+        "history = []\n"
+        "if state_path.is_file():\n"
+        "    history = json.loads(state_path.read_text())\n"
+        "server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "server.bind(endpoint); server.listen(8)\n"
+        "while True:\n"
+        "    connection, _ = server.accept()\n"
+        "    with connection:\n"
+        "        request = json.loads(connection.makefile().readline())\n"
+        "        if request['op'] == 'stop':\n"
+        "            connection.sendall(b'{\"stopped\": true}\\n'); break\n"
+        "        if request['op'] == 'ping':\n"
+        "            payload = {'instance_id': instance_id, 'history_length': len(history), 'execution_evidence': 'runtime-executed'}\n"
+        "        else:\n"
+        "            inputs = []\n"
+        "            for item in request.get('inputs', []):\n"
+        "                data = pathlib.Path(item['path']).read_bytes()\n"
+        "                digest = hashlib.sha256(data).hexdigest()\n"
+        "                if digest != item['sha256'] or len(data) != item['byte_length']:\n"
+        "                    raise ValueError('canonical artifact identity changed')\n"
+        "                inputs.append({'kind': item['kind'], 'path': item['path'], 'sha256': digest, 'byte_length': len(data)})\n"
+        "            work = None\n"
+        "            if request.get('command'):\n"
+        "                environment = dict(os.environ, FIDENAUT_CANONICAL_INPUTS=json.dumps(inputs))\n"
+        "                output = pathlib.Path(request['output'])\n"
+        "                before = output.stat() if output.is_file() else None\n"
+        "                child = subprocess.Popen(request['command'], cwd=request['cwd'], env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "                try:\n"
+        "                    exit_code = child.wait(timeout=request['timeout'])\n"
+        "                except subprocess.TimeoutExpired:\n"
+        "                    child.kill(); child.wait(); exit_code = -9\n"
+        "                artifact = None\n"
+        "                if output.is_file():\n"
+        "                    after = output.stat()\n"
+        "                    if before is None or (before.st_ino, before.st_mtime_ns, before.st_size) != (after.st_ino, after.st_mtime_ns, after.st_size):\n"
+        "                        data = output.read_bytes()\n"
+        "                        artifact = {'path': str(output), 'sha256': hashlib.sha256(data).hexdigest(), 'byte_length': len(data)}\n"
+        "                changes = []\n"
+        "                for changed in request.get('changed_paths', []):\n"
+        "                    data = pathlib.Path(changed).read_bytes()\n"
+        "                    changes.append({'path': changed, 'sha256': hashlib.sha256(data).hexdigest(), 'byte_length': len(data)})\n"
+        "                work = {'pid': child.pid, 'process_group': os.getpgid(0), 'exit_code': exit_code, 'artifact': artifact, 'changes': changes}\n"
+        "            history.append({'operation': request['operation'], 'payload': request.get('payload'), 'inputs': inputs, 'work': work})\n"
+        "            state_path.write_text(json.dumps(history, sort_keys=True) + '\\n')\n"
+        "            payload = {'instance_id': instance_id, 'history_length': len(history), 'operation': request['operation'], 'execution_evidence': 'runtime-executed', 'worker_pid': os.getpid(), 'inputs': inputs, 'work': work}\n"
+        "        connection.sendall((json.dumps(payload, sort_keys=True) + '\\n').encode())\n"
+        "server.close(); pathlib.Path(endpoint).unlink(missing_ok=True)\n"
+    )
+
+    def __init__(self, root):
+        self.root = pathlib.Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._processes = {}
+
+    def establish(self, execution_scope, role):
+        instance_id = uuid.uuid4().hex
+        state_path = self.root / (instance_id + ".history.json")
+        endpoint = pathlib.Path(tempfile.gettempdir()) / (
+            "fidenaut-" + instance_id + ".sock"
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                self._WORKER,
+                instance_id,
+                str(state_path),
+                str(endpoint),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            text=True,
+        )
+        binding = {
+            "execution_scope": execution_scope,
+            "role": role,
+            "instance_id": instance_id,
+            "process_group": process.pid,
+            "history_path": str(state_path),
+            "endpoint": str(endpoint),
+        }
+        self._processes[instance_id] = process
+        deadline = time.monotonic() + 2
+        while not endpoint.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                self.stop(binding)
+                raise RuntimeUnavailable("managed execution instance failed to start")
+            time.sleep(POLL_INTERVAL_SECONDS)
+        if process.poll() is not None:
+            raise RuntimeUnavailable("managed execution instance failed to start")
+        return binding
+
+    def _process_for(self, binding):
+        instance_id = binding.get("instance_id")
+        process = self._processes.get(instance_id)
+        endpoint = binding.get("endpoint")
+        if not instance_id or not endpoint or process is not None and process.poll() is not None:
+            raise RuntimeUnavailable("managed execution instance is unavailable")
+        return instance_id, process, endpoint
+
+    def _request(self, binding, request):
+        instance_id, process, endpoint = self._process_for(binding)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(2)
+                connection.connect(endpoint)
+                connection.sendall((json.dumps(request) + "\n").encode())
+                response = json.loads(connection.makefile().readline())
+        except (OSError, ValueError) as error:
+            raise RuntimeUnavailable(
+                "managed execution instance could not resume"
+            ) from error
+        if response.get("instance_id") != instance_id:
+            raise RuntimeUnavailable("runtime returned evidence for another instance")
+        return response
+
+    def execute(self, binding, operation, payload, *, command=None, cwd=None,
+                output=None, inputs=None, changed_paths=None, timeout=300):
+        request = {"op": "execute", "operation": operation, "payload": payload}
+        if command is not None:
+            if not command or not all(isinstance(part, str) and part for part in command):
+                raise ValueError("managed role work requires a nonempty command")
+            request.update(command=command, cwd=str(cwd), output=str(output),
+                           inputs=inputs or [], changed_paths=changed_paths or [],
+                           timeout=timeout)
+        return self._request(binding, request)
+
+    def resume(self, binding):
+        return self._request(binding, {"op": "ping"})
+
+    def stop(self, binding):
+        instance_id, process, endpoint = self._process_for(binding)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.connect(endpoint)
+                connection.sendall(b'{"op":"stop"}\n')
+            if process is not None:
+                process.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=1)
+        finally:
+            self._processes.pop(instance_id, None)
+
+    def replace(self, binding, role):
+        original_id = binding.get("instance_id")
+        replacement = self.establish(binding["execution_scope"], role)
+        replacement["replaces"] = original_id
+        return replacement
+
+    @staticmethod
+    def assert_distinct(bindings):
+        instance_ids = [binding.get("instance_id") for binding in bindings]
+        if len(instance_ids) != len(set(instance_ids)):
+            raise ValueError("role bindings alias one execution instance")
+
+    def close(self):
+        for binding in list(self._processes):
+            try:
+                self.stop({
+                    "instance_id": binding,
+                    "endpoint": str(
+                        pathlib.Path(tempfile.gettempdir())
+                        / ("fidenaut-" + binding + ".sock")
+                    ),
+                })
+            except RuntimeUnavailable:
+                self._processes.pop(binding, None)
 
 
 class _ProcessGroupOwnership:
