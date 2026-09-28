@@ -108,6 +108,370 @@ class WorkflowSupervisorTest(unittest.TestCase):
             self.assertEqual(planner["instance_id"], replacement["replaces"])
             runtime.close()
 
+    def test_managed_role_work_outlives_controller_wait_and_is_not_reexecuted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime = supervisor.ManagedExecutionRuntime(root / "runtime")
+            binding = runtime.establish("issue-63", "planner")
+            output = root / "plan.md"
+            counter = root / "executions"
+            source = (
+                "import pathlib,sys,time; "
+                "counter=pathlib.Path(sys.argv[1]); "
+                "counter.write_text(str(int(counter.read_text())+1) if counter.exists() else '1'); "
+                "time.sleep(2.15); "
+                "pathlib.Path(sys.argv[2]).write_text('completed')"
+            )
+            started = time.monotonic()
+            receipt = runtime.execute(
+                binding,
+                "plan",
+                {"output": str(output)},
+                command=python_command(source, counter, output),
+                cwd=root,
+                output=output,
+                timeout=5,
+                request_id="long-role-operation",
+            )
+            self.assertGreaterEqual(time.monotonic() - started, 2)
+            self.assertEqual("completed", output.read_text())
+            self.assertEqual("1", counter.read_text())
+            self.assertEqual(binding["instance_id"], receipt["instance_id"])
+            self.assertEqual("planner", receipt["role"])
+            self.assertEqual("long-role-operation", receipt["request_id"])
+            self.assertEqual(1, receipt["history_length"])
+            self.assertEqual(
+                receipt,
+                runtime.recover(
+                    binding,
+                    receipt["request_id"],
+                    receipt["request_sha256"],
+                ),
+            )
+            retried = runtime.execute(
+                binding,
+                "plan",
+                {"output": str(output)},
+                command=python_command(source, counter, output),
+                cwd=root,
+                output=output,
+                timeout=5,
+                request_id="long-role-operation",
+            )
+            self.assertEqual(receipt, retried)
+            runtime.close()
+            history = json.loads(
+                pathlib.Path(binding["history_path"]).read_text()
+            )
+            self.assertEqual(1, len(history))
+            self.assertEqual("completed", history[0]["status"])
+            self.assertEqual(
+                "idempotent-replay-response-written",
+                history[0]["recovery_status"],
+            )
+            self.assertEqual(3, history[0]["recovery_attempts"])
+            self.assertEqual("1", counter.read_text())
+
+    def test_managed_runtime_recovers_after_controller_disconnect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime = supervisor.ManagedExecutionRuntime(root / "runtime")
+            binding = runtime.establish("issue-63", "planner")
+            output = root / "plan.md"
+            started = root / "started"
+            release = root / "release"
+            counter = root / "executions"
+            source = (
+                "import pathlib,sys,time; "
+                "started,release,counter,output=map(pathlib.Path,sys.argv[1:]); "
+                "started.write_text('yes'); "
+                "deadline=time.monotonic()+5; "
+                "exec(\"while not release.exists() and time.monotonic()<deadline: time.sleep(.01)\"); "
+                "counter.write_text(str(int(counter.read_text())+1) if counter.exists() else '1'); "
+                "output.write_text('completed')"
+            )
+            request = runtime._execution_request(
+                binding,
+                "plan",
+                {"output": str(output)},
+                command=python_command(source, started, release, counter, output),
+                cwd=root,
+                output=output,
+                timeout=5,
+                request_id="disconnected-role-operation",
+            )
+            response_errors = []
+
+            def disconnecting_request():
+                try:
+                    runtime._request(binding, request, timeout=0.2)
+                except supervisor.RuntimeResponseTimeout as error:
+                    response_errors.append(error)
+
+            controller = threading.Thread(target=disconnecting_request)
+            controller.start()
+            wait_for_path(started)
+            controller.join(timeout=2)
+            self.assertFalse(controller.is_alive())
+            self.assertEqual(1, len(response_errors))
+            self.assertFalse(output.exists())
+            release.write_text("continue")
+
+            receipt = runtime.recover(
+                binding,
+                request["request_id"],
+                request["request_sha256"],
+                timeout=5,
+            )
+            self.assertEqual(binding["instance_id"], receipt["instance_id"])
+            self.assertEqual("1", counter.read_text())
+            self.assertEqual("completed", output.read_text())
+            self.assertEqual(1, receipt["history_length"])
+            runtime.close()
+            history = json.loads(pathlib.Path(binding["history_path"]).read_text())
+            self.assertEqual("completed", history[0]["status"])
+            self.assertEqual(1, history[0]["recovery_attempts"])
+            self.assertEqual("recovery-response-written", history[0]["recovery_status"])
+            self.assertEqual("written", history[0]["response_write_status"])
+
+    def test_managed_runtime_rejects_stale_mismatched_and_wrong_context_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime = supervisor.ManagedExecutionRuntime(root / "runtime")
+            planner = runtime.establish("issue-63", "planner")
+            reviewer = runtime.establish("issue-63", "reviewer")
+            output = root / "plan.md"
+            counter = root / "executions"
+            command = python_command(
+                "import pathlib,sys; "
+                "counter,output=map(pathlib.Path,sys.argv[1:]); "
+                "counter.write_text(str(int(counter.read_text())+1) if counter.exists() else '1'); "
+                "output.write_text('completed')",
+                counter,
+                output,
+            )
+            receipt = runtime.execute(
+                planner,
+                "plan",
+                {"output": str(output)},
+                command=command,
+                cwd=root,
+                output=output,
+                timeout=5,
+                request_id="bound-role-operation",
+            )
+            self.assertIsNone(
+                runtime.recover(planner, "stale-operation", receipt["request_sha256"])
+            )
+            with self.assertRaises(supervisor.RuntimeUnavailable):
+                runtime.recover(
+                    planner,
+                    receipt["request_id"],
+                    "0" * 64,
+                )
+            with self.assertRaises(supervisor.RuntimeUnavailable):
+                runtime.recover(
+                    reviewer,
+                    receipt["request_id"],
+                    receipt["request_sha256"],
+                )
+            with self.assertRaises(supervisor.RuntimeUnavailable):
+                runtime.execute(
+                    planner,
+                    "different-operation",
+                    {"output": str(output)},
+                    command=command,
+                    cwd=root,
+                    output=output,
+                    timeout=5,
+                    request_id=receipt["request_id"],
+                )
+            duplicate = runtime.execute(
+                planner,
+                "plan",
+                {"output": str(output)},
+                command=command,
+                cwd=root,
+                output=output,
+                timeout=5,
+                request_id=receipt["request_id"],
+            )
+            self.assertEqual(receipt, duplicate)
+            runtime.close()
+            history = json.loads(
+                pathlib.Path(planner["history_path"]).read_text()
+            )
+            self.assertEqual(1, len(history))
+            self.assertEqual(1, history[0]["recovery_attempts"])
+            self.assertEqual(
+                "idempotent-replay-response-written",
+                history[0]["recovery_status"],
+            )
+            self.assertEqual("1", counter.read_text())
+
+    def test_distinct_logical_operations_with_identical_contents_execute_once_each(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime = supervisor.ManagedExecutionRuntime(root / "runtime")
+            binding = runtime.establish("issue-63", "planner")
+            output = root / "plan.md"
+            counter = root / "executions"
+            command = python_command(
+                "import pathlib,sys; "
+                "counter,output=map(pathlib.Path,sys.argv[1:]); "
+                "counter.write_text(str(int(counter.read_text())+1) if counter.exists() else '1'); "
+                "output.write_text('identical-request-content')",
+                counter,
+                output,
+            )
+
+            def execute(operation_id):
+                return runtime.execute(
+                    binding,
+                    "plan",
+                    {"output": str(output)},
+                    command=command,
+                    cwd=root,
+                    output=output,
+                    timeout=5,
+                    request_id=operation_id,
+                )
+
+            first = execute("logical-operation-1")
+            retry = execute("logical-operation-1")
+            new_operation = execute("logical-operation-2")
+            later_revision = execute("logical-plan-revision-2")
+            self.assertEqual(first, retry)
+            self.assertEqual("logical-operation-1", first["request_id"])
+            self.assertEqual("logical-operation-2", new_operation["request_id"])
+            self.assertEqual(
+                "logical-plan-revision-2", later_revision["request_id"]
+            )
+            self.assertEqual(1, first["history_length"])
+            self.assertEqual(2, new_operation["history_length"])
+            self.assertEqual(3, later_revision["history_length"])
+            self.assertEqual(first["request_sha256"], new_operation["request_sha256"])
+            self.assertEqual(first["request_sha256"], later_revision["request_sha256"])
+            self.assertEqual("3", counter.read_text())
+            runtime.close()
+
+    def test_operation_ids_are_reserved_across_role_and_replacement_contexts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime = supervisor.ManagedExecutionRuntime(root / "runtime")
+            planner = runtime.establish("issue-63", "planner")
+            reviewer = runtime.establish("issue-63", "reviewer")
+            output = root / "plan.md"
+            counter = root / "executions"
+            command = python_command(
+                "import pathlib,sys; "
+                "counter,output=map(pathlib.Path,sys.argv[1:]); "
+                "counter.write_text(str(int(counter.read_text())+1) if counter.exists() else '1'); "
+                "output.write_text('completed')",
+                counter,
+                output,
+            )
+
+            def execute(binding):
+                return runtime.execute(
+                    binding,
+                    "plan",
+                    {"output": str(output)},
+                    command=command,
+                    cwd=root,
+                    output=output,
+                    timeout=5,
+                    request_id="globally-owned-operation",
+                )
+
+            receipt = execute(planner)
+            with self.assertRaises(supervisor.RuntimeUnavailable):
+                execute(reviewer)
+            replacement = runtime.replace(planner, "planner")
+            with self.assertRaises(supervisor.RuntimeUnavailable):
+                execute(replacement)
+            self.assertEqual("1", counter.read_text())
+            self.assertEqual(
+                [],
+                json.loads(pathlib.Path(reviewer["history_path"]).read_text())
+                if pathlib.Path(reviewer["history_path"]).exists()
+                else [],
+            )
+            self.assertEqual(
+                [],
+                json.loads(pathlib.Path(replacement["history_path"]).read_text())
+                if pathlib.Path(replacement["history_path"]).exists()
+                else [],
+            )
+            self.assertEqual(
+                receipt,
+                runtime.execute(
+                    planner,
+                    "plan",
+                    {"output": str(output)},
+                    command=command,
+                    cwd=root,
+                    output=output,
+                    timeout=5,
+                    request_id="globally-owned-operation",
+                ),
+            )
+            self.assertEqual("1", counter.read_text())
+            runtime.close()
+
+    def test_managed_runtime_fails_closed_when_completion_is_ambiguous(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime = supervisor.ManagedExecutionRuntime(root / "runtime")
+            binding = runtime.establish("issue-63", "planner")
+            started = root / "started"
+            release = root / "release"
+            output = root / "plan.md"
+            source = (
+                "import pathlib,sys,time; "
+                "started,release,output=map(pathlib.Path,sys.argv[1:]); "
+                "started.write_text('yes'); "
+                "exec(\"while not release.exists(): time.sleep(.01)\"); "
+                "output.write_text('should-not-complete')"
+            )
+            request = runtime._execution_request(
+                binding,
+                "plan",
+                {"output": str(output)},
+                command=python_command(source, started, release, output),
+                cwd=root,
+                output=output,
+                timeout=5,
+                request_id="ambiguous-role-operation",
+            )
+            request_errors = []
+
+            def blocked_request():
+                try:
+                    runtime._request(binding, request, timeout=5)
+                except supervisor.RuntimeUnavailable as error:
+                    request_errors.append(error)
+
+            controller = threading.Thread(target=blocked_request)
+            controller.start()
+            wait_for_path(started)
+            os.killpg(binding["process_group"], signal.SIGKILL)
+            controller.join(timeout=2)
+            self.assertFalse(controller.is_alive())
+            self.assertTrue(request_errors)
+            with self.assertRaises(supervisor.RuntimeUnavailable):
+                runtime.recover(
+                    binding,
+                    request["request_id"],
+                    request["request_sha256"],
+                )
+            history = json.loads(
+                pathlib.Path(binding["history_path"]).read_text()
+            )
+            self.assertEqual("running", history[0]["status"])
+            self.assertFalse(output.exists())
+            runtime.close()
+
     def test_success_returns_bounded_structured_output(self):
         result = self.run_supervised(
             python_command(
