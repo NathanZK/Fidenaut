@@ -5,6 +5,7 @@ import argparse
 import base64
 import datetime as dt
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 
 if __package__:
     from . import workflow_supervisor
@@ -248,6 +250,20 @@ def _run_root(root, config, issue):
     return _artifact_root(root, config) / ("issue-%s" % issue)
 
 
+@contextmanager
+def _role_work_lock(root, config, issue):
+    """Serialize role-work dispatch, recovery, acceptance, and replacement."""
+    run_root = _run_root(root, config, issue)
+    run_root.mkdir(parents=True, exist_ok=True)
+    lock_path = run_root / ".role-work.lock"
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 ROLE_WORK_STAGES = {
     "PLANNING": ("planner", "plan", "plan_review"),
     "PLAN_REVIEW": ("reviewer", "plan_review", "plan"),
@@ -283,13 +299,30 @@ def _role_context(root, config, state, role):
                 "role contexts resolve to the same execution instance",
             )
         runtime.resume(binding)
+    except workflow_supervisor.RuntimeResponseTimeout as error:
+        _raise(
+            "role-context-busy",
+            "managed execution context is not responding while work may still be active: %s"
+            % error,
+        )
     except workflow_supervisor.RuntimeUnavailable as error:
         _raise("role-context-unavailable", str(error))
     return runtime, binding
 
 
 def command_run_role(args, root, config):
+    with _role_work_lock(root, config, args.issue):
+        return _command_run_role_locked(args, root, config)
+
+
+def _command_run_role_locked(args, root, config):
     """Run role work in the assigned process, with canonical inputs from state."""
+    _ensure(
+        args.operation_id is None
+        or isinstance(args.operation_id, str) and args.operation_id.strip(),
+        "invalid-role-operation-id",
+        "--operation-id must be a nonempty string",
+    )
     state = _read_state(root, config, args.issue)
     _ensure(_managed_role_work(config), "role-runtime-disabled", "managed role work is not configured")
     role, output_kind, input_kind = ROLE_WORK_STAGES.get(state["status"], (None, None, None))
@@ -334,30 +367,161 @@ def command_run_role(args, root, config):
             "role work may modify only approved paths assigned to its role",
         )
         changed_paths.append(str((root / path).resolve()))
+    timeout = _effective_limits(config, "validation")["timeout_ms"] / 1000
     runtime, binding = _role_context(root, config, state, role)
-    receipt = runtime.execute(
-        binding, output_kind, {"output": str(output)}, command=command,
-        cwd=root, output=output, inputs=inputs, changed_paths=changed_paths,
-        timeout=_effective_limits(config, "validation")["timeout_ms"] / 1000,
+    payload = {"output": str(output)}
+    request_digest = runtime.request_digest(
+        binding, output_kind, payload, command=command, cwd=root, output=output,
+        inputs=inputs, changed_paths=changed_paths, timeout=timeout,
     )
+    pending_work = state.setdefault("role_work_pending", {})
+    _ensure(
+        isinstance(pending_work, dict),
+        "role-work-recovery-mismatch",
+        "pending role operation evidence is malformed",
+    )
+    _ensure(
+        not any(kind != output_kind for kind in pending_work),
+        "role-work-recovery-mismatch",
+        "another role operation is still pending recovery",
+    )
+    pending = pending_work.get(output_kind)
+    _ensure(
+        pending is None or isinstance(pending, dict),
+        "role-work-recovery-mismatch",
+        "pending role operation evidence is malformed",
+    )
+    new_pending = pending is None
+    if pending is None:
+        request_id = args.operation_id or uuid.uuid4().hex
+        pending = {
+            "role": role,
+            "binding": binding["instance_id"],
+            "operation": output_kind,
+            "output": str(output),
+            "request_id": request_id,
+            "request_sha256": request_digest,
+        }
+        pending_work[output_kind] = pending
+    else:
+        _ensure(
+            pending.get("role") == role
+            and pending.get("binding") == binding["instance_id"]
+            and pending.get("operation") == output_kind
+            and pending.get("output") == str(output)
+            and (
+                args.operation_id is None
+                or pending.get("request_id") == args.operation_id
+            )
+            and pending.get("request_sha256") == request_digest,
+            "role-work-recovery-mismatch",
+            "pending role operation does not match this request and execution context",
+        )
+    try:
+        runtime.reserve_operation_identity(
+            binding, pending["request_id"], pending["request_sha256"]
+        )
+    except workflow_supervisor.RuntimeUnavailable as error:
+        _raise("role-operation-id-conflict", str(error))
+    if new_pending:
+        _write_state(root, config, args.issue, state)
+    try:
+        receipt = runtime.recover(
+            binding,
+            pending["request_id"],
+            pending["request_sha256"],
+            timeout=max(
+                timeout + workflow_supervisor.CONTROLLER_RESPONSE_TIMEOUT_SECONDS,
+                2,
+            ),
+        )
+        if receipt is None:
+            receipt = runtime.execute(
+                binding, output_kind, payload, command=command,
+                cwd=root, output=output, inputs=inputs,
+                changed_paths=changed_paths, timeout=timeout,
+                request_id=pending["request_id"],
+            )
+    except workflow_supervisor.RuntimeUnavailable as error:
+        _write_state(root, config, args.issue, state)
+        _raise("role-work-recovery-unavailable", str(error))
+    except workflow_supervisor.RuntimeResponseTimeout as error:
+        _write_state(root, config, args.issue, state)
+        _raise("role-work-recovery-pending", str(error))
     _ensure(
         receipt.get("instance_id") == binding["instance_id"]
+        and receipt.get("role") == role
+        and receipt.get("execution_scope") == binding["execution_scope"]
+        and receipt.get("request_id") == pending["request_id"]
+        and receipt.get("request_sha256") == pending["request_sha256"]
+        and receipt.get("operation") == output_kind
         and receipt.get("worker_pid") == binding["process_group"]
         and receipt.get("execution_evidence") == "runtime-executed"
-        and receipt.get("work", {}).get("process_group") == binding["process_group"],
+        and isinstance(receipt.get("work"), dict)
+        and receipt["work"].get("process_group") == binding["process_group"]
+        and receipt.get("inputs") == inputs,
         "runtime-execution-mismatch",
-        "role work did not execute in its assigned runtime instance",
+        "role work receipt does not match its assigned operation and runtime context",
     )
     _ensure(
-        receipt["work"]["exit_code"] == 0 and receipt["work"]["artifact"] is not None,
+        receipt["work"].get("exit_code") == 0
+        and receipt["work"].get("artifact") is not None,
         "role-work-failed",
         "role command failed or did not produce its artifact",
     )
+    artifact_receipt = receipt["work"]["artifact"]
+    _ensure(
+        isinstance(artifact_receipt, dict) and output.is_file(),
+        "role-work-artifact-mismatch",
+        "runtime-produced output is missing or unverifiable",
+    )
+    try:
+        artifact_data = output.read_bytes()
+    except OSError as error:
+        _raise("role-work-artifact-mismatch", "unable to verify role output: %s" % error)
+    _ensure(
+        artifact_receipt.get("path") == str(output)
+        and artifact_receipt.get("byte_length") == len(artifact_data)
+        and artifact_receipt.get("sha256") == hashlib.sha256(artifact_data).hexdigest(),
+        "role-work-artifact-mismatch",
+        "runtime-produced output does not match the recovered artifact evidence",
+    )
+    recorded_changes = receipt["work"].get("changes")
+    _ensure(
+        isinstance(recorded_changes, list)
+        and all(isinstance(item, dict) for item in recorded_changes)
+        and [item.get("path") for item in recorded_changes] == changed_paths,
+        "role-work-source-mismatch",
+        "runtime source-change evidence does not match the requested paths",
+    )
+    for changed in recorded_changes:
+        changed_path = pathlib.Path(changed["path"])
+        _ensure(
+            changed_path.is_file(),
+            "role-work-source-mismatch",
+            "runtime-produced source is missing or unverifiable",
+        )
+        try:
+            changed_data = changed_path.read_bytes()
+        except OSError as error:
+            _raise(
+                "role-work-source-mismatch",
+                "unable to verify role-produced source: %s" % error,
+            )
+        _ensure(
+            changed.get("byte_length") == len(changed_data)
+            and changed.get("sha256") == hashlib.sha256(changed_data).hexdigest(),
+            "role-work-source-mismatch",
+            "runtime-produced source does not match the recovered change evidence",
+        )
     state.setdefault("role_work", {})[output_kind] = {
         "role": role,
         "binding": binding["instance_id"],
         "receipt": receipt,
     }
+    pending_work.pop(output_kind)
+    if not pending_work:
+        state.pop("role_work_pending", None)
     _write_state(root, config, args.issue, state)
     return {"ok": True, "status": state["status"], "receipt": receipt}
 
@@ -406,6 +570,11 @@ def _require_role_work(root, config, state, role, kind, supplied_path):
 
 
 def command_replace_role_context(args, root, config):
+    with _role_work_lock(root, config, args.issue):
+        return _command_replace_role_context_locked(args, root, config)
+
+
+def _command_replace_role_context_locked(args, root, config):
     """Explicitly replace an unavailable execution without rewriting its lineage."""
     state = _read_state(root, config, args.issue)
     _ensure(state["status"] in ROLE_WORK_STAGES, "invalid-transition", "role replacement is not available at this gate")
@@ -418,6 +587,12 @@ def command_replace_role_context(args, root, config):
     )
     try:
         runtime.resume(binding)
+    except workflow_supervisor.RuntimeResponseTimeout as error:
+        _raise(
+            "role-context-busy",
+            "managed execution context may still be active; replacement is not authorized by an IPC timeout: %s"
+            % error,
+        )
     except workflow_supervisor.RuntimeUnavailable:
         pass
     else:
@@ -478,13 +653,59 @@ def _read_state(root, config, issue):
         "provider-runtime-identity-mismatch",
         "workflow state provider runtime identity does not match current provider inputs",
     )
+    revision = state.setdefault("_state_revision", 0)
+    _ensure(
+        isinstance(revision, int) and not isinstance(revision, bool) and revision >= 0,
+        "invalid-state",
+        "Workflow state revision is invalid",
+    )
     return state
 
 
 def _write_state(root, config, issue, state):
-    """Persist state and refresh its modification timestamp."""
-    state["updated_at"] = _now()
-    _write_json(_state_path(root, config, issue), state)
+    """Persist only if the state snapshot has not been superseded."""
+    run_root = _run_root(root, config, issue)
+    run_root.mkdir(parents=True, exist_ok=True)
+    lock_path = run_root / ".state-write.lock"
+    state_path = _state_path(root, config, issue)
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            expected_revision = state.get("_state_revision", 0)
+            _ensure(
+                isinstance(expected_revision, int)
+                and not isinstance(expected_revision, bool)
+                and expected_revision >= 0,
+                "invalid-state",
+                "Workflow state revision is invalid",
+            )
+            if state_path.is_file():
+                current = _read_json(state_path, "workflow state")
+                current_revision = current.get("_state_revision", 0)
+            else:
+                current_revision = 0
+            _ensure(
+                isinstance(current_revision, int)
+                and not isinstance(current_revision, bool)
+                and current_revision >= 0,
+                "invalid-state",
+                "Persisted workflow state revision is invalid",
+            )
+            _ensure(
+                current_revision == expected_revision,
+                "concurrent-state-update",
+                "workflow state changed after this command read it; refusing to overwrite newer state",
+            )
+            next_state = dict(state)
+            next_state["_state_revision"] = expected_revision + 1
+            next_state["updated_at"] = _now()
+            _write_json(state_path, next_state)
+            state.update(
+                _state_revision=next_state["_state_revision"],
+                updated_at=next_state["updated_at"],
+            )
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _expect_status(state, expected, operation):
@@ -10784,6 +11005,13 @@ def build_parser():
     run_role.add_argument("--output", required=True)
     run_role.add_argument("--command", dest="role_command", required=True)
     run_role.add_argument("--changed-path", action="append", default=[])
+    run_role.add_argument(
+        "--operation-id",
+        help=(
+            "stable logical operation identity to reuse when retrying an already "
+            "accepted run-role invocation"
+        ),
+    )
 
     replace_role_context = subparsers.add_parser("replace-role-context")
     _add_root(replace_role_context)

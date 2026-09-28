@@ -1265,8 +1265,41 @@ The controller accepts work only when the runtime returns evidence for the
 resolved instance. A binding string, role label, Python object, or
 `COPILOT_AGENT_SESSION_ID` observation is not assignment, execution proof, or
 authentication. Distinct role bindings must resolve to distinct instances.
-Recovery first attempts the original; an explicitly authorized replacement
-gets a new binding and lineage.
+An IPC response timeout is not proof that the original context is unavailable;
+an unresponsive context may still be executing and cannot be replaced on that
+basis.
+The initial two-second controller/runtime IPC response wait is separate from
+the configured role-command execution timeout: a lost response does not cancel
+the command or authorize another execution. Before dispatch, `run-role`
+persists a request identity bound to the original instance, role, operation,
+canonical inputs, output, command, and changed paths. The runtime journals
+dispatch, completion, response-write outcome, and recovery attempts, and an
+identical retry first requests that exact operation's result; the runtime will
+return a completed receipt or refuse an
+ambiguous/incomplete request rather than execute it again. A receipt recovered
+after response loss is accepted only after the same instance, request, input,
+artifact, source-change, and role checks as a directly returned receipt.
+Runtime history alone is not a `run-role` receipt. Until those checks pass,
+`role_work` is not accepted. If the original result cannot be verified,
+`run-role` fails closed and retains the pending request evidence. Recovery
+first uses the original instance; an explicitly authorized replacement gets
+a new binding and lineage, and does not turn an ambiguous earlier operation
+into accepted role work.
+Each `run-role` invocation has a distinct logical operation ID, independent of
+its request-content fingerprint. A retry of an already accepted invocation
+must pass the same `--operation-id`; retries of a still-pending invocation
+also reuse its durable pending ID. A new operation, including one with
+byte-for-byte identical inputs and command, uses a new ID and is executed as
+new work. The runtime keeps a durable operation-ID ownership index for the
+governed execution, binding each ID to its request fingerprint, role, and
+original instance. Reusing an ID from another role or replacement context is
+rejected before dispatch; the ID itself is not proof of a valid receipt.
+
+Workflow state writes use a per-run lock and revision check. A command that
+read an older state snapshot cannot replace a newer persisted revision; it
+fails explicitly and leaves the newer role-work, pending, and recovery state
+intact. The lock covers the state comparison and atomic write, not the
+surrounding command or unrelated workflow work.
 
 Before `submit-plan`, `submit-tests`, or `submit-implementation` (and before
 each corresponding `review-*`), invoke `run-role ISSUE --agent ROLE
@@ -1283,7 +1316,8 @@ returning producer); it reads these files in the shared canonical store.
 When the original worker is unavailable, `run-role` fails explicitly.
 `replace-role-context ISSUE --role ROLE --by REQUESTER` is the explicit
 replacement decision at the current role gate; it records a distinct
-replacement binding and its original lineage.
+replacement binding and its original lineage. It does not silently resume or
+reclassify an unverified pending operation.
 
 This does not create role-local artifacts. Producers and reviewers continue to
 use canonical artifact/evidence paths, preserving identity, provenance,
@@ -1299,7 +1333,7 @@ The complete configured Python workflow suite is the workflow-tooling gate; focu
 ```bash
 python3 scripts/agent_workflow.py init ISSUE
 python3 scripts/agent_workflow.py status ISSUE
-python3 scripts/agent_workflow.py run-role ISSUE --agent ROLE --output PATH --command '["executable","argument",...]'
+python3 scripts/agent_workflow.py run-role ISSUE --agent ROLE --output PATH --command '["executable","argument",...]' [--operation-id ID]
 python3 scripts/agent_workflow.py replace-role-context ISSUE --role ROLE --by REQUESTER
 python3 scripts/agent_workflow.py supersede-run ISSUE --by REQUESTER --reason "..." --confirm supersede_confirmed
 python3 scripts/agent_workflow.py submit-plan ISSUE --artifact PATH --agent chess-echo-planner

@@ -2,6 +2,8 @@
 """Bounded, policy-free supervision for one external process session."""
 
 import base64
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -21,10 +23,35 @@ from contextlib import contextmanager
 RESULT_FORMAT = "chess-echo-process-result-v3"
 READ_SIZE = 64 * 1024
 POLL_INTERVAL_SECONDS = 0.01
+CONTROLLER_RESPONSE_TIMEOUT_SECONDS = 2
 
 
 class RuntimeUnavailable(Exception):
     """A previously assigned managed execution cannot be resumed."""
+
+
+class RuntimeResponseTimeout(Exception):
+    """The controller stopped waiting before the runtime returned a response."""
+
+
+def _managed_request_digest(binding, request):
+    evidence = {
+        "instance_id": binding.get("instance_id"),
+        "role": binding.get("role"),
+        "execution_scope": binding.get("execution_scope"),
+        "operation": request["operation"],
+        "payload": request.get("payload"),
+        "command": request.get("command"),
+        "cwd": request.get("cwd"),
+        "output": request.get("output"),
+        "inputs": request.get("inputs", []),
+        "changed_paths": request.get("changed_paths", []),
+        "timeout": request.get("timeout"),
+    }
+    serialized = json.dumps(
+        evidence, sort_keys=True, ensure_ascii=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
 
 
 class ManagedExecutionRuntime:
@@ -38,53 +65,151 @@ class ManagedExecutionRuntime:
 
     _WORKER = (
         "import hashlib, json, os, pathlib, socket, subprocess, sys\n"
-        "instance_id, state_path, endpoint = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3]\n"
-        "history = []\n"
-        "if state_path.is_file():\n"
-        "    history = json.loads(state_path.read_text())\n"
+        "instance_id, role, execution_scope = sys.argv[1:4]\n"
+        "state_path, endpoint = pathlib.Path(sys.argv[4]), sys.argv[5]\n"
+        "history = json.loads(state_path.read_text()) if state_path.is_file() else []\n"
+        "def persist_history():\n"
+        "    temporary = state_path.with_name(state_path.name + '.tmp')\n"
+        "    temporary.write_text(json.dumps(history, sort_keys=True) + '\\n')\n"
+        "    os.replace(temporary, state_path)\n"
+        "def request_digest(request):\n"
+        "    evidence = {'instance_id': instance_id, 'role': role, 'execution_scope': execution_scope, "
+        "'operation': request['operation'], 'payload': request.get('payload'), "
+        "'command': request.get('command'), 'cwd': request.get('cwd'), "
+        "'output': request.get('output'), 'inputs': request.get('inputs', []), "
+        "'changed_paths': request.get('changed_paths', []), 'timeout': request.get('timeout')}\n"
+        "    encoded = json.dumps(evidence, sort_keys=True, ensure_ascii=True, separators=(',', ':')).encode()\n"
+        "    return hashlib.sha256(encoded).hexdigest()\n"
+        "def verified_receipt(entry):\n"
+        "    receipt = entry.get('receipt')\n"
+        "    if (not isinstance(receipt, dict) or receipt.get('instance_id') != instance_id "
+        "or receipt.get('role') != role or receipt.get('execution_scope') != execution_scope "
+        "or receipt.get('request_id') != entry.get('request_id') "
+        "or receipt.get('request_sha256') != entry.get('request_sha256') "
+        "or receipt.get('operation') != entry.get('operation') "
+        "or receipt.get('inputs') != entry.get('inputs') "
+        "or receipt.get('work') != entry.get('work') "
+        "or receipt.get('history_length') != history.index(entry) + 1 "
+        "or receipt.get('execution_evidence') != 'runtime-executed'):\n"
+        "        raise ValueError('runtime receipt does not match its execution history')\n"
+        "    return receipt\n"
+        "def send(connection, payload):\n"
+        "    try:\n"
+        "        connection.sendall((json.dumps(payload, sort_keys=True) + '\\n').encode())\n"
+        "        return True\n"
+        "    except OSError:\n"
+        "        return False\n"
         "server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
         "server.bind(endpoint); server.listen(8)\n"
         "while True:\n"
         "    connection, _ = server.accept()\n"
         "    with connection:\n"
-        "        request = json.loads(connection.makefile().readline())\n"
-        "        if request['op'] == 'stop':\n"
-        "            connection.sendall(b'{\"stopped\": true}\\n'); break\n"
-        "        if request['op'] == 'ping':\n"
-        "            payload = {'instance_id': instance_id, 'history_length': len(history), 'execution_evidence': 'runtime-executed'}\n"
-        "        else:\n"
-        "            inputs = []\n"
-        "            for item in request.get('inputs', []):\n"
-        "                data = pathlib.Path(item['path']).read_bytes()\n"
-        "                digest = hashlib.sha256(data).hexdigest()\n"
-        "                if digest != item['sha256'] or len(data) != item['byte_length']:\n"
-        "                    raise ValueError('canonical artifact identity changed')\n"
-        "                inputs.append({'kind': item['kind'], 'path': item['path'], 'sha256': digest, 'byte_length': len(data)})\n"
-        "            work = None\n"
-        "            if request.get('command'):\n"
-        "                environment = dict(os.environ, FIDENAUT_CANONICAL_INPUTS=json.dumps(inputs))\n"
-        "                output = pathlib.Path(request['output'])\n"
-        "                before = output.stat() if output.is_file() else None\n"
-        "                child = subprocess.Popen(request['command'], cwd=request['cwd'], env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
-        "                try:\n"
-        "                    exit_code = child.wait(timeout=request['timeout'])\n"
-        "                except subprocess.TimeoutExpired:\n"
-        "                    child.kill(); child.wait(); exit_code = -9\n"
-        "                artifact = None\n"
-        "                if output.is_file():\n"
-        "                    after = output.stat()\n"
-        "                    if before is None or (before.st_ino, before.st_mtime_ns, before.st_size) != (after.st_ino, after.st_mtime_ns, after.st_size):\n"
-        "                        data = output.read_bytes()\n"
-        "                        artifact = {'path': str(output), 'sha256': hashlib.sha256(data).hexdigest(), 'byte_length': len(data)}\n"
-        "                changes = []\n"
-        "                for changed in request.get('changed_paths', []):\n"
-        "                    data = pathlib.Path(changed).read_bytes()\n"
-        "                    changes.append({'path': changed, 'sha256': hashlib.sha256(data).hexdigest(), 'byte_length': len(data)})\n"
-        "                work = {'pid': child.pid, 'process_group': os.getpgid(0), 'exit_code': exit_code, 'artifact': artifact, 'changes': changes}\n"
-        "            history.append({'operation': request['operation'], 'payload': request.get('payload'), 'inputs': inputs, 'work': work})\n"
-        "            state_path.write_text(json.dumps(history, sort_keys=True) + '\\n')\n"
-        "            payload = {'instance_id': instance_id, 'history_length': len(history), 'operation': request['operation'], 'execution_evidence': 'runtime-executed', 'worker_pid': os.getpid(), 'inputs': inputs, 'work': work}\n"
-        "        connection.sendall((json.dumps(payload, sort_keys=True) + '\\n').encode())\n"
+        "        response_kind = None\n"
+        "        try:\n"
+        "            request = json.loads(connection.makefile().readline())\n"
+        "            if request['op'] == 'stop':\n"
+        "                send(connection, {'stopped': True}); break\n"
+        "            if request['op'] == 'ping':\n"
+        "                payload = {'instance_id': instance_id, 'role': role, 'execution_scope': execution_scope, "
+        "'history_length': len(history), 'execution_evidence': 'runtime-executed'}\n"
+        "            elif request['op'] == 'recover':\n"
+        "                matches = [entry for entry in history if entry.get('request_id') == request.get('request_id')]\n"
+        "                if len(matches) > 1:\n"
+        "                    payload = {'instance_id': instance_id, 'error': 'duplicate request history is ambiguous'}\n"
+        "                elif not matches:\n"
+        "                    payload = {'instance_id': instance_id, 'recovery': 'not-found'}\n"
+        "                else:\n"
+        "                    entry = matches[0]\n"
+        "                    if entry.get('request_sha256') != request.get('request_sha256'):\n"
+        "                        payload = {'instance_id': instance_id, 'error': 'recovery request identity mismatch'}\n"
+        "                    elif entry.get('instance_id') != instance_id or entry.get('role') != role or entry.get('execution_scope') != execution_scope:\n"
+        "                        payload = {'instance_id': instance_id, 'error': 'recovery execution context mismatch'}\n"
+        "                    elif entry.get('status') != 'completed' or not isinstance(entry.get('receipt'), dict):\n"
+        "                        payload = {'instance_id': instance_id, 'error': 'operation is incomplete or unverifiable; refusing replay'}\n"
+        "                    else:\n"
+        "                        payload = verified_receipt(entry)\n"
+        "                        entry['recovery_attempts'] = entry.get('recovery_attempts', 0) + 1\n"
+        "                        entry['recovery_status'] = 'response-pending'\n"
+        "                        persist_history(); response_kind = 'recovery'\n"
+        "            elif request['op'] == 'execute':\n"
+        "                request_id = request.get('request_id')\n"
+        "                request_hash = request_digest(request)\n"
+        "                if not isinstance(request_id, str) or not request_id or request.get('request_sha256') != request_hash:\n"
+        "                    payload = {'instance_id': instance_id, 'error': 'execution request identity is invalid'}\n"
+        "                else:\n"
+        "                    matches = [entry for entry in history if entry.get('request_id') == request_id]\n"
+        "                    if len(matches) > 1:\n"
+        "                        payload = {'instance_id': instance_id, 'error': 'duplicate request history is ambiguous'}\n"
+        "                    elif matches:\n"
+        "                        entry = matches[0]\n"
+        "                        if entry.get('request_sha256') != request_hash:\n"
+        "                            payload = {'instance_id': instance_id, 'error': 'logical request identity was reused'}\n"
+        "                        elif entry.get('status') == 'completed' and isinstance(entry.get('receipt'), dict):\n"
+        "                            payload = verified_receipt(entry)\n"
+        "                            entry['recovery_attempts'] = entry.get('recovery_attempts', 0) + 1\n"
+        "                            entry['recovery_status'] = 'idempotent-execute-replay-pending'\n"
+        "                            persist_history(); response_kind = 'idempotent-replay'\n"
+        "                        else:\n"
+        "                            payload = {'instance_id': instance_id, 'error': 'operation is incomplete or unverifiable; refusing replay'}\n"
+        "                    else:\n"
+        "                        entry = {'request_id': request_id, 'request_sha256': request_hash, 'instance_id': instance_id, "
+        "'role': role, 'execution_scope': execution_scope, 'operation': request['operation'], "
+        "'payload': request.get('payload'), 'inputs': [], 'work': None, 'status': 'running'}\n"
+        "                        history.append(entry); persist_history()\n"
+        "                        try:\n"
+        "                            inputs = []\n"
+        "                            for item in request.get('inputs', []):\n"
+        "                                data = pathlib.Path(item['path']).read_bytes()\n"
+        "                                digest = hashlib.sha256(data).hexdigest()\n"
+        "                                if digest != item['sha256'] or len(data) != item['byte_length']:\n"
+        "                                    raise ValueError('canonical artifact identity changed')\n"
+        "                                inputs.append({'kind': item['kind'], 'path': item['path'], 'sha256': digest, 'byte_length': len(data)})\n"
+        "                            work = None\n"
+        "                            if request.get('command'):\n"
+        "                                environment = dict(os.environ, FIDENAUT_CANONICAL_INPUTS=json.dumps(inputs))\n"
+        "                                output = pathlib.Path(request['output'])\n"
+        "                                before = output.stat() if output.is_file() else None\n"
+        "                                child = subprocess.Popen(request['command'], cwd=request['cwd'], env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "                                try:\n"
+        "                                    exit_code = child.wait(timeout=request['timeout'])\n"
+        "                                except subprocess.TimeoutExpired:\n"
+        "                                    child.kill(); child.wait(); exit_code = -9\n"
+        "                                artifact = None\n"
+        "                                if output.is_file():\n"
+        "                                    after = output.stat()\n"
+        "                                    if before is None or (before.st_ino, before.st_mtime_ns, before.st_size) != (after.st_ino, after.st_mtime_ns, after.st_size):\n"
+        "                                        data = output.read_bytes()\n"
+        "                                        artifact = {'path': str(output), 'sha256': hashlib.sha256(data).hexdigest(), 'byte_length': len(data)}\n"
+        "                                changes = []\n"
+        "                                for changed in request.get('changed_paths', []):\n"
+        "                                    data = pathlib.Path(changed).read_bytes()\n"
+        "                                    changes.append({'path': changed, 'sha256': hashlib.sha256(data).hexdigest(), 'byte_length': len(data)})\n"
+        "                                work = {'pid': child.pid, 'process_group': os.getpgid(0), 'exit_code': exit_code, 'artifact': artifact, 'changes': changes}\n"
+        "                            entry.update(inputs=inputs, work=work, status='completed')\n"
+        "                            entry.update(recovery_attempts=0, recovery_status='not-requested', response_write_status='pending')\n"
+        "                            receipt = {'instance_id': instance_id, 'role': role, 'execution_scope': execution_scope, "
+        "'request_id': request_id, 'request_sha256': request_hash, 'history_length': len(history), "
+        "'operation': request['operation'], 'execution_evidence': 'runtime-executed', "
+        "'worker_pid': os.getpid(), 'inputs': inputs, 'work': work}\n"
+        "                            entry['receipt'] = receipt; persist_history(); payload = receipt\n"
+        "                        except Exception as error:\n"
+        "                            entry.update(status='failed', error=str(error)); persist_history()\n"
+        "                            payload = {'instance_id': instance_id, 'error': 'managed operation failed: ' + str(error)}\n"
+        "            else:\n"
+        "                payload = {'instance_id': instance_id, 'error': 'unsupported runtime operation'}\n"
+        "        except Exception as error:\n"
+        "            payload = {'instance_id': instance_id, 'error': 'runtime request failed: ' + str(error)}\n"
+        "        payload.setdefault('role', role); payload.setdefault('execution_scope', execution_scope)\n"
+        "        response_written = send(connection, payload)\n"
+        "        request_id = payload.get('request_id')\n"
+        "        if request_id:\n"
+        "            matches = [entry for entry in history if entry.get('request_id') == request_id]\n"
+        "            if len(matches) == 1:\n"
+        "                entry = matches[0]\n"
+        "                entry['response_write_status'] = 'written' if response_written else 'failed'\n"
+        "                if response_kind:\n"
+        "                    entry['recovery_status'] = response_kind + '-response-written' if response_written else response_kind + '-response-failed'\n"
+        "                persist_history()\n"
         "server.close(); pathlib.Path(endpoint).unlink(missing_ok=True)\n"
     )
 
@@ -94,6 +219,7 @@ class ManagedExecutionRuntime:
         self._processes = {}
 
     def establish(self, execution_scope, role):
+        execution_scope = str(execution_scope)
         instance_id = uuid.uuid4().hex
         state_path = self.root / (instance_id + ".history.json")
         endpoint = pathlib.Path(tempfile.gettempdir()) / (
@@ -106,6 +232,8 @@ class ManagedExecutionRuntime:
                 "-c",
                 self._WORKER,
                 instance_id,
+                role,
+                str(execution_scope),
                 str(state_path),
                 str(endpoint),
             ],
@@ -138,39 +266,248 @@ class ManagedExecutionRuntime:
         instance_id = binding.get("instance_id")
         process = self._processes.get(instance_id)
         endpoint = binding.get("endpoint")
-        if not instance_id or not endpoint or process is not None and process.poll() is not None:
+        if (
+            not instance_id
+            or not endpoint
+            or process is not None and process.poll() is not None
+        ):
             raise RuntimeUnavailable("managed execution instance is unavailable")
         return instance_id, process, endpoint
 
-    def _request(self, binding, request):
+    def _operation_identity_paths(self):
+        prefix = self.root.name + "."
+        return (
+            self.root.parent / (prefix + "operation-identities.json"),
+            self.root.parent / (prefix + ".operation-identities.lock"),
+        )
+
+    def _read_operation_identities(self, path):
+        if not path.exists():
+            return {"format": "managed-operation-identities-v1", "operations": {}}
+        try:
+            registry = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise RuntimeUnavailable(
+                "managed operation identity registry is unreadable"
+            ) from error
+        if (
+            not isinstance(registry, dict)
+            or registry.get("format") != "managed-operation-identities-v1"
+            or not isinstance(registry.get("operations"), dict)
+        ):
+            raise RuntimeUnavailable(
+                "managed operation identity registry is malformed"
+            )
+        return registry
+
+    @staticmethod
+    def _operation_identity(binding, request_id, request_sha256):
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or not isinstance(request_sha256, str)
+            or not request_sha256
+        ):
+            raise RuntimeUnavailable("managed operation identity is invalid")
+        return {
+            "instance_id": binding.get("instance_id"),
+            "role": binding.get("role"),
+            "execution_scope": binding.get("execution_scope"),
+            "request_sha256": request_sha256,
+        }
+
+    def reserve_operation_identity(self, binding, request_id, request_sha256):
+        """Durably reserve an ID for one request and its original role instance."""
+        expected = self._operation_identity(binding, request_id, request_sha256)
+        registry_path, lock_path = self._operation_identity_paths()
+        self.root.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                registry = self._read_operation_identities(registry_path)
+                previous = registry["operations"].get(request_id)
+                if previous is not None and previous != expected:
+                    raise RuntimeUnavailable(
+                        "logical operation ID is already bound to different request or context"
+                    )
+                if previous is None:
+                    registry["operations"][request_id] = expected
+                    temporary_path = registry_path.with_name(
+                        registry_path.name + ".tmp"
+                    )
+                    try:
+                        with temporary_path.open("w", encoding="utf-8") as output:
+                            json.dump(registry, output, sort_keys=True)
+                            output.write("\n")
+                            output.flush()
+                            os.fsync(output.fileno())
+                        os.replace(temporary_path, registry_path)
+                        try:
+                            directory_fd = os.open(
+                                str(registry_path.parent),
+                                getattr(os, "O_DIRECTORY", 0),
+                            )
+                        except OSError as error:
+                            if error.errno not in (
+                                errno.EINVAL,
+                                errno.ENOTSUP,
+                                errno.EOPNOTSUPP,
+                                errno.ENOSYS,
+                            ):
+                                raise
+                        else:
+                            try:
+                                os.fsync(directory_fd)
+                            finally:
+                                os.close(directory_fd)
+                    finally:
+                        temporary_path.unlink(missing_ok=True)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def validate_operation_identity(self, binding, request_id, request_sha256):
+        """Check an existing ID binding without claiming an unknown ID."""
+        expected = self._operation_identity(binding, request_id, request_sha256)
+        registry_path, lock_path = self._operation_identity_paths()
+        if not registry_path.exists():
+            return False
+        with lock_path.open("a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                registry = self._read_operation_identities(registry_path)
+                previous = registry["operations"].get(request_id)
+                if previous is None:
+                    return False
+                if previous != expected:
+                    raise RuntimeUnavailable(
+                        "logical operation ID is already bound to different request or context"
+                    )
+                return True
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _request(self, binding, request, timeout=CONTROLLER_RESPONSE_TIMEOUT_SECONDS):
         instance_id, process, endpoint = self._process_for(binding)
+        if request.get("op") == "execute":
+            if request.get("request_sha256") != _managed_request_digest(
+                binding, request
+            ):
+                raise RuntimeUnavailable("execution request identity is invalid")
+            self.reserve_operation_identity(
+                binding, request.get("request_id"), request.get("request_sha256")
+            )
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(2)
+                connection.settimeout(timeout)
                 connection.connect(endpoint)
                 connection.sendall((json.dumps(request) + "\n").encode())
                 response = json.loads(connection.makefile().readline())
+        except socket.timeout as error:
+            raise RuntimeResponseTimeout(
+                "controller stopped waiting for managed execution response"
+            ) from error
         except (OSError, ValueError) as error:
             raise RuntimeUnavailable(
                 "managed execution instance could not resume"
             ) from error
-        if response.get("instance_id") != instance_id:
+        if (
+            response.get("instance_id") != instance_id
+            or response.get("role") != binding.get("role")
+            or response.get("execution_scope") != binding.get("execution_scope")
+        ):
             raise RuntimeUnavailable("runtime returned evidence for another instance")
+        if response.get("error"):
+            raise RuntimeUnavailable(response["error"])
         return response
 
+    @staticmethod
+    def _execution_request(
+        binding, operation, payload, *, command=None, cwd=None, output=None,
+        inputs=None, changed_paths=None, timeout=300, request_id=None,
+    ):
+        request = {
+            "op": "execute",
+            "operation": operation,
+            "payload": payload,
+            "command": command,
+            "cwd": str(cwd) if cwd is not None else None,
+            "output": str(output) if output is not None else None,
+            "inputs": inputs or [],
+            "changed_paths": changed_paths or [],
+            "timeout": timeout,
+            "request_id": request_id or uuid.uuid4().hex,
+        }
+        request["request_sha256"] = _managed_request_digest(binding, request)
+        return request
+
+    def request_digest(
+        self, binding, operation, payload, *, command=None, cwd=None, output=None,
+        inputs=None, changed_paths=None, timeout=300,
+    ):
+        request = self._execution_request(
+            binding, operation, payload, command=command, cwd=cwd, output=output,
+            inputs=inputs, changed_paths=changed_paths, timeout=timeout,
+            request_id="identity-only",
+        )
+        return request["request_sha256"]
+
     def execute(self, binding, operation, payload, *, command=None, cwd=None,
-                output=None, inputs=None, changed_paths=None, timeout=300):
-        request = {"op": "execute", "operation": operation, "payload": payload}
+                output=None, inputs=None, changed_paths=None, timeout=300,
+                request_id=None):
         if command is not None:
             if not command or not all(isinstance(part, str) and part for part in command):
                 raise ValueError("managed role work requires a nonempty command")
-            request.update(command=command, cwd=str(cwd), output=str(output),
-                           inputs=inputs or [], changed_paths=changed_paths or [],
-                           timeout=timeout)
-        return self._request(binding, request)
+        request = self._execution_request(
+            binding, operation, payload, command=command, cwd=cwd, output=output,
+            inputs=inputs, changed_paths=changed_paths, timeout=timeout,
+            request_id=request_id,
+        )
+        try:
+            return self._request(binding, request)
+        except RuntimeResponseTimeout:
+            recovered = self.recover(
+                binding,
+                request["request_id"],
+                request["request_sha256"],
+                timeout=max(float(timeout) + CONTROLLER_RESPONSE_TIMEOUT_SECONDS, 2),
+            )
+            if recovered is not None:
+                return recovered
+            return self._request(
+                binding, request,
+                timeout=max(float(timeout) + CONTROLLER_RESPONSE_TIMEOUT_SECONDS, 2),
+            )
 
-    def resume(self, binding):
-        return self._request(binding, {"op": "ping"})
+    def recover(
+        self, binding, request_id, request_sha256,
+        timeout=CONTROLLER_RESPONSE_TIMEOUT_SECONDS,
+    ):
+        if not self.validate_operation_identity(
+            binding, request_id, request_sha256
+        ):
+            return None
+        response = self._request(
+            binding,
+            {
+                "op": "recover",
+                "request_id": request_id,
+                "request_sha256": request_sha256,
+            },
+            timeout=timeout,
+        )
+        if response.get("recovery") == "not-found":
+            return None
+        if (
+            response.get("request_id") != request_id
+            or response.get("request_sha256") != request_sha256
+        ):
+            raise RuntimeUnavailable("runtime returned mismatched recovery evidence")
+        return response
+
+    def resume(
+        self, binding, timeout=CONTROLLER_RESPONSE_TIMEOUT_SECONDS
+    ):
+        return self._request(binding, {"op": "ping"}, timeout=timeout)
 
     def stop(self, binding):
         instance_id, process, endpoint = self._process_for(binding)

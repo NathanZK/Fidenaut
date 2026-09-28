@@ -11,8 +11,11 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from types import SimpleNamespace
 from unittest import mock
 
 from scripts import agent_workflow as workflow
@@ -275,7 +278,9 @@ class AgentWorkflowTest(unittest.TestCase):
         self.git("commit", "-qm", "Enable managed role execution in fixture")
         self.git("update-ref", "refs/remotes/origin/main", "HEAD")
 
-    def execute_role_artifact(self, role, name, content, changed_path=None):
+    def execute_role_artifact(
+        self, role, name, content, changed_path=None, operation_id=None
+    ):
         source = (
             "import json, os, pathlib, sys; "
             "inputs=json.loads(os.environ['FIDENAUT_CANONICAL_INPUTS']); "
@@ -291,6 +296,7 @@ class AgentWorkflowTest(unittest.TestCase):
             "--output", output, "--command",
             json.dumps([sys.executable, "-c", source, output, content, changed_path or "-"]),
             *([] if changed_path is None else ["--changed-path", changed_path]),
+            *([] if operation_id is None else ["--operation-id", operation_id]),
         )
         self.assertEqual(0, code, result)
         receipt = result["receipt"]
@@ -381,6 +387,501 @@ class AgentWorkflowTest(unittest.TestCase):
         self.assertEqual(original["instance_id"], self.state()["role_context_replacements"][0]["original"])
         self.execute_role_artifact("planner", "plan.md", "replacement")
         self.assertEqual(1, self.state()["role_work"]["plan"]["receipt"]["history_length"])
+
+    def test_replacement_rejects_a_busy_original_execution_context(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        runtime_root = (
+            self.root / ".agent-workflow" / "runs" / f"issue-{ISSUE}" / "contexts"
+        )
+        runtime = workflow.workflow_supervisor.ManagedExecutionRuntime(runtime_root)
+        binding = runtime.establish(ISSUE, "planner")
+        state = self.state()
+        state["role_contexts"] = {"planner": binding}
+        self.write_state(state)
+
+        started = self.root / "busy-role-started"
+        output = self.root / "busy-role-output"
+        counter = self.root / "busy-role-counter"
+        source = (
+            "import pathlib,sys,time; "
+            "started,count,out=map(pathlib.Path,sys.argv[1:]); "
+            "started.write_text('running'); time.sleep(3.2); "
+            "count.write_text(str(int(count.read_text())+1) if count.exists() else '1'); "
+            "out.write_text('done')"
+        )
+        command = [
+            sys.executable, "-c", source, str(started), str(counter), str(output)
+        ]
+        request = runtime._execution_request(
+            binding,
+            "plan",
+            {"output": str(output)},
+            command=command,
+            cwd=self.root,
+            output=output,
+            timeout=5,
+            request_id="busy-original-context",
+        )
+        state["role_work_pending"] = {
+            "plan": {
+                "role": "planner",
+                "binding": binding["instance_id"],
+                "operation": "plan",
+                "output": str(output),
+                "request_id": request["request_id"],
+                "request_sha256": request["request_sha256"],
+            }
+        }
+        self.write_state(state)
+        result = []
+
+        def dispatch_busy_operation():
+            try:
+                result.append(runtime._request(binding, request, timeout=0.2))
+            except workflow.workflow_supervisor.RuntimeResponseTimeout as error:
+                result.append(error)
+
+        worker = threading.Thread(target=dispatch_busy_operation)
+        self.addCleanup(runtime.close)
+        worker.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not started.exists():
+            time.sleep(0.01)
+        self.assertTrue(started.exists(), "original role command did not start")
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        self.assertIsInstance(
+            result[0], workflow.workflow_supervisor.RuntimeResponseTimeout
+        )
+        code, failure, _ = self.run_cli(
+            "replace-role-context", str(ISSUE), "--role", "planner", "--by", "operator",
+        )
+        self.assertEqual(1, code)
+        self.assertEqual("role-context-busy", failure["error"]["code"])
+        self.assertEqual(binding["instance_id"], self.state()["role_contexts"]["planner"]["instance_id"])
+        self.assertNotIn("role_context_replacements", self.state())
+        self.assertEqual(
+            request["request_id"],
+            self.state()["role_work_pending"]["plan"]["request_id"],
+        )
+        self.assertFalse(output.exists())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not output.exists():
+            time.sleep(0.01)
+        self.assertTrue(output.exists())
+        receipt = runtime.recover(
+            binding, request["request_id"], request["request_sha256"], timeout=2
+        )
+        self.assertEqual(binding["instance_id"], receipt["instance_id"])
+        self.assertEqual("1", counter.read_text())
+        runtime.close()
+
+    def test_run_role_operation_ids_distinguish_retry_from_identical_new_work(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        _, first = self.execute_role_artifact(
+            "planner", "plan.md", "identical request", operation_id="plan-op-1"
+        )
+        _, retry = self.execute_role_artifact(
+            "planner", "plan.md", "identical request", operation_id="plan-op-1"
+        )
+        _, new_operation = self.execute_role_artifact(
+            "planner", "plan.md", "identical request", operation_id="plan-op-2"
+        )
+        _, later_revision = self.execute_role_artifact(
+            "planner", "plan.md", "identical request", operation_id="plan-revision-2"
+        )
+        self.assertEqual(first["request_id"], retry["request_id"])
+        self.assertEqual(first["history_length"], retry["history_length"])
+        self.assertNotEqual(first["request_id"], new_operation["request_id"])
+        self.assertNotEqual(first["request_id"], later_revision["request_id"])
+        self.assertEqual(first["request_sha256"], new_operation["request_sha256"])
+        self.assertEqual(first["request_sha256"], later_revision["request_sha256"])
+        self.assertEqual(3, later_revision["history_length"])
+
+    def test_run_role_rejects_operation_id_from_another_role_context(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        _, planner_receipt = self.execute_role_artifact(
+            "planner", "plan.md", "planner output",
+            operation_id="planner-owned-operation",
+        )
+        state = self.state()
+        state["status"] = "PLAN_REVIEW"
+        self.write_state(state)
+
+        marker = self.root / "reviewer-command-ran"
+        code, result, _ = self.run_cli(
+            "run-role", str(ISSUE), "--agent", "chess-echo-reviewer",
+            "--output", "artifacts-src/plan-review.md", "--operation-id",
+            planner_receipt["request_id"], "--command",
+            json.dumps([
+                sys.executable, "-c",
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')",
+                str(marker),
+            ]),
+        )
+        self.assertEqual(1, code)
+        self.assertEqual("role-operation-id-conflict", result["error"]["code"])
+        self.assertFalse(marker.exists())
+        state = self.state()
+        self.assertNotIn("role_work_pending", state)
+        self.assertNotIn("plan_review", state.get("role_work", {}))
+        self.assertEqual(
+            planner_receipt["request_id"],
+            json.loads(
+                pathlib.Path(
+                    state["role_contexts"]["planner"]["history_path"]
+                ).read_text()
+            )[0]["request_id"],
+        )
+        self.addCleanup(self.stop_role_contexts)
+
+    def test_run_role_rejects_operation_id_from_replaced_context(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        _, planner_receipt = self.execute_role_artifact(
+            "planner", "plan.md", "planner output",
+            operation_id="original-planner-operation",
+        )
+        original_state = self.state()
+        original = original_state["role_contexts"]["planner"]
+        runtime_root = (
+            self.root / ".agent-workflow" / "runs" / f"issue-{ISSUE}" / "contexts"
+        )
+        stopping_runtime = workflow.workflow_supervisor.ManagedExecutionRuntime(
+            runtime_root
+        )
+        stopping_runtime.stop(original)
+
+        code, replaced, _ = self.run_cli(
+            "replace-role-context", str(ISSUE), "--role", "planner",
+            "--by", "operator",
+        )
+        self.assertEqual(0, code, replaced)
+        replacement = replaced["replacement"]
+        self.assertNotEqual(original["instance_id"], replacement["instance_id"])
+        marker = self.root / "replacement-command-ran"
+        code, result, _ = self.run_cli(
+            "run-role", str(ISSUE), "--agent", "chess-echo-planner",
+            "--output", "artifacts-src/plan.md", "--operation-id",
+            planner_receipt["request_id"], "--command",
+            json.dumps([
+                sys.executable, "-c",
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')",
+                str(marker),
+            ]),
+        )
+        self.assertEqual(1, code)
+        self.assertEqual("role-operation-id-conflict", result["error"]["code"])
+        self.assertFalse(marker.exists())
+        state = self.state()
+        self.assertEqual(replacement["instance_id"], state["role_contexts"]["planner"]["instance_id"])
+        self.assertEqual(
+            original["instance_id"],
+            state["role_context_replacements"][0]["original"],
+        )
+        self.assertNotIn("role_work_pending", state)
+        self.addCleanup(self.stop_role_contexts)
+
+    def test_stale_submit_plan_write_cannot_erase_new_role_work_acceptance(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        plan, _ = self.execute_role_artifact("planner", "plan.md", "initial plan")
+        code, submitted, _ = self.run_cli_with_session(
+            "planner-session",
+            "submit-plan", str(ISSUE), "--artifact", plan, "--agent",
+            "chess-echo-planner", "--scope", "src/Example.kt",
+        )
+        self.assertEqual(0, code, submitted)
+        review, _ = self.execute_role_artifact(
+            "reviewer", "plan-review.md", "request revision"
+        )
+        code, reviewed, _ = self.run_cli_with_session(
+            "reviewer-session",
+            "review-plan", str(ISSUE), "--status", workflow.REVISION,
+            "--artifact", review, "--reviewer", "chess-echo-reviewer",
+        )
+        self.assertEqual(0, code, reviewed)
+        self.assertEqual("PLANNING", self.state()["status"])
+
+        config = workflow._load_config(self.root)
+        submit_args = SimpleNamespace(
+            issue=ISSUE,
+            agent="chess-echo-planner",
+            artifact=plan,
+            scope=["src/Example.kt"],
+        )
+        original_require = workflow._require_role_work
+        new_receipts = []
+
+        def accept_new_work_after_stale_read(
+            root, active_config, state, role, kind, supplied_path
+        ):
+            original_require(
+                root, active_config, state, role, kind, supplied_path
+            )
+            if not new_receipts:
+                _, receipt = self.execute_role_artifact(
+                    "planner", "plan.md", "revised plan",
+                    operation_id="concurrent-revised-plan",
+                )
+                new_receipts.append(receipt)
+
+        with mock.patch.object(
+            workflow, "_require_role_work", side_effect=accept_new_work_after_stale_read
+        ):
+            with self.assertRaises(workflow.WorkflowError) as raised:
+                workflow.command_submit_plan(submit_args, self.root, config)
+        self.assertEqual("concurrent-state-update", raised.exception.code)
+        current = self.state()
+        self.assertEqual("PLANNING", current["status"])
+        self.assertEqual(
+            new_receipts[0]["request_id"],
+            current["role_work"]["plan"]["receipt"]["request_id"],
+        )
+        self.assertNotIn("role_work_pending", current)
+
+        code, submitted, _ = self.run_cli_with_session(
+            "planner-session",
+            "submit-plan", str(ISSUE), "--artifact", plan, "--agent",
+            "chess-echo-planner", "--scope", "src/Example.kt",
+        )
+        self.assertEqual(0, code, submitted)
+        self.assertEqual("PLAN_REVIEW", self.state()["status"])
+        self.addCleanup(self.stop_role_contexts)
+
+    def stop_role_contexts(self):
+        state_path = (
+            self.root / ".agent-workflow" / "runs" / f"issue-{ISSUE}" / "state.json"
+        )
+        if not state_path.is_file():
+            return
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        runtime = workflow.workflow_supervisor.ManagedExecutionRuntime(
+            self.root / ".agent-workflow" / "runs" / f"issue-{ISSUE}" / "contexts"
+        )
+        for binding in state.get("role_contexts", {}).values():
+            try:
+                runtime.stop(binding)
+            except workflow.workflow_supervisor.RuntimeUnavailable:
+                pass
+
+    def test_concurrent_run_role_retries_share_one_pending_operation(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        started = self.root / "concurrent-role-started"
+        release = self.root / "concurrent-role-release"
+        counter = self.root / "concurrent-role-counter"
+        output = self.root / "artifacts-src" / "plan.md"
+
+        source = (
+            "import pathlib,sys,time; "
+            "started,release,counter,output=map(pathlib.Path,sys.argv[1:]); "
+            "started.write_text('started'); "
+            "deadline=time.monotonic()+8; "
+            "exec(\"while not release.exists() and time.monotonic()<deadline: time.sleep(.01)\"); "
+            "counter.write_text(str(int(counter.read_text())+1) if counter.exists() else '1'); "
+            "output.write_text('one logical operation')"
+        )
+        command = [
+            sys.executable, "-c", source,
+            str(started), str(release), str(counter), str(output),
+        ]
+        arguments = SimpleNamespace(
+            issue=ISSUE,
+            agent="chess-echo-planner",
+            output="artifacts-src/plan.md",
+            role_command=json.dumps(command),
+            changed_path=[],
+            operation_id="concurrent-logical-operation",
+        )
+        config = workflow._load_config(self.root)
+        lock_attempts = {
+            "first": threading.Event(),
+            "second": threading.Event(),
+        }
+        completed = {
+            "first": threading.Event(),
+            "second": threading.Event(),
+        }
+        results = {}
+        errors = {}
+        original_lock = workflow._role_work_lock
+
+        def tracked_lock(root, lock_config, issue):
+            lock_attempts[threading.current_thread().name].set()
+            return original_lock(root, lock_config, issue)
+
+        def invoke(name):
+            try:
+                results[name] = workflow.command_run_role(arguments, self.root, config)
+            except Exception as error:
+                errors[name] = error
+            finally:
+                completed[name].set()
+
+        with mock.patch.object(workflow, "_role_work_lock", side_effect=tracked_lock):
+            first = threading.Thread(target=invoke, args=("first",), name="first")
+            first.start()
+            self.assertTrue(lock_attempts["first"].wait(timeout=2))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not started.exists():
+                time.sleep(0.01)
+            self.assertTrue(started.exists(), "first concurrent operation did not start")
+            second = threading.Thread(target=invoke, args=("second",), name="second")
+            second.start()
+            self.assertTrue(lock_attempts["second"].wait(timeout=2))
+            self.assertFalse(
+                completed["second"].wait(timeout=0.1),
+                "competing invocation must wait for the pending operation",
+            )
+            self.assertFalse(output.exists())
+            release.write_text("continue")
+            first.join(timeout=8)
+            second.join(timeout=8)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual({}, errors)
+        first_result = results["first"]
+        second_result = results["second"]
+        self.assertEqual(
+            first_result["receipt"]["request_id"],
+            second_result["receipt"]["request_id"],
+        )
+        self.assertEqual(first_result["receipt"], second_result["receipt"])
+        self.assertEqual("1", counter.read_text())
+        state = self.state()
+        self.assertNotIn("role_work_pending", state)
+        self.assertEqual(
+            first_result["receipt"]["request_id"],
+            state["role_work"]["plan"]["receipt"]["request_id"],
+        )
+        binding = state["role_contexts"]["planner"]
+        history = json.loads(pathlib.Path(binding["history_path"]).read_text())
+        self.assertEqual(1, len(history))
+        cleanup_runtime = workflow.workflow_supervisor.ManagedExecutionRuntime(
+            self.root / ".agent-workflow" / "runs" / f"issue-{ISSUE}" / "contexts"
+        )
+        cleanup_runtime.stop(binding)
+
+    def test_run_role_recovers_disconnected_operation_without_duplicate_or_early_acceptance(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        state = self.state()
+        state["status"] = "TEST_IMPLEMENTATION"
+        state["approved_scope"] = ["src/test/ExampleTest.kt"]
+        self.write_state(state)
+
+        started = self.root / "role-started"
+        release = self.root / "role-release"
+        counter = self.root / "role-executions"
+        output = self.root / "artifacts-src" / "test-report.md"
+        changed = self.root / "src" / "test" / "ExampleTest.kt"
+        source = (
+            "import pathlib,sys,time; "
+            "started,release,counter,output,changed=map(pathlib.Path,sys.argv[1:]); "
+            "started.write_text('started'); "
+            "deadline=time.monotonic()+5; "
+            "exec(\"while not release.exists() and time.monotonic()<deadline: time.sleep(.01)\"); "
+            "counter.write_text(str(int(counter.read_text())+1) if counter.exists() else '1'); "
+            "output.write_text('role-output'); "
+            "changed.parent.mkdir(parents=True,exist_ok=True); "
+            "changed.write_text('role-source')"
+        )
+        command = [
+            sys.executable, "-c", source,
+            str(started), str(release), str(counter), str(output), str(changed),
+        ]
+        arguments = (
+            "run-role", str(ISSUE), "--agent", "chess-echo-test-implementer",
+            "--output", "artifacts-src/test-report.md", "--command",
+            json.dumps(command), "--changed-path", "src/test/ExampleTest.kt",
+            "--operation-id", "issue-63-disconnect-test-operation",
+        )
+        def disconnect_after_dispatch(runtime, binding, operation, payload, **options):
+            request = runtime._execution_request(
+                binding, operation, payload, **options
+            )
+            return runtime._request(binding, request, timeout=0.2)
+
+        with mock.patch.object(
+            workflow.workflow_supervisor.ManagedExecutionRuntime,
+            "execute",
+            disconnect_after_dispatch,
+        ):
+            code, failure, _ = self.run_cli(*arguments)
+        self.assertEqual(1, code)
+        self.assertEqual("role-work-recovery-pending", failure["error"]["code"])
+        state = self.state()
+        self.assertNotIn("test_report", state.get("role_work", {}))
+        pending = state["role_work_pending"]["test_report"]
+        binding = state["role_contexts"]["test_implementer"]
+        cleanup_runtime = workflow.workflow_supervisor.ManagedExecutionRuntime(
+            self.root / ".agent-workflow" / "runs" / f"issue-{ISSUE}" / "contexts"
+        )
+        self.addCleanup(cleanup_runtime.stop, binding)
+        self.assertEqual(binding["instance_id"], pending["binding"])
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not started.exists():
+            time.sleep(0.01)
+        self.assertTrue(started.exists(), "role command did not start")
+        self.assertFalse(output.exists())
+
+        release.write_text("continue")
+        history_path = pathlib.Path(binding["history_path"])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if history_path.is_file():
+                history = json.loads(history_path.read_text())
+                if history and history[0]["status"] == "completed":
+                    break
+            time.sleep(0.01)
+        else:
+            self.fail("managed role operation did not complete")
+
+        for field, bad_value in (
+            ("request_id", "stale-request"),
+            ("binding", "wrong-execution-instance"),
+        ):
+            altered = self.state()
+            altered["role_work_pending"]["test_report"][field] = bad_value
+            self.write_state(altered)
+            code, rejected, _ = self.run_cli(*arguments)
+            self.assertEqual(1, code)
+            self.assertEqual(
+                "role-work-recovery-mismatch", rejected["error"]["code"]
+            )
+            self.assertNotIn("test_report", self.state().get("role_work", {}))
+            self.write_state(state)
+
+        output.write_text("tampered")
+        changed.write_text("tampered")
+        code, rejected, _ = self.run_cli(*arguments)
+        self.assertEqual(1, code)
+        self.assertEqual("role-work-artifact-mismatch", rejected["error"]["code"])
+        self.assertNotIn("test_report", self.state().get("role_work", {}))
+        output.write_text("role-output")
+        changed.write_text("role-source")
+
+        code, recovered, _ = self.run_cli(*arguments)
+        self.assertEqual(0, code, recovered)
+        receipt = recovered["receipt"]
+        self.assertEqual(binding["instance_id"], receipt["instance_id"])
+        self.assertEqual(binding["instance_id"], self.state()["role_work"]["test_report"]["binding"])
+        self.assertEqual(
+            hashlib.sha256(changed.read_bytes()).hexdigest(),
+            receipt["work"]["changes"][0]["sha256"],
+        )
+        self.assertEqual("1", counter.read_text())
+        self.assertEqual(1, len(json.loads(history_path.read_text())))
+
+        code, replayed, _ = self.run_cli(*arguments)
+        self.assertEqual(0, code, replayed)
+        self.assertEqual(receipt, replayed["receipt"])
+        self.assertEqual("1", counter.read_text())
+        self.assertEqual(1, len(json.loads(history_path.read_text())))
 
     def test_managed_role_rejects_distinct_bindings_to_one_worker(self):
         self.enable_role_execution()
