@@ -180,6 +180,22 @@ preconditions and failure modes are in
 
 ## Security and governance boundary
 
+Role-context assignment has a separate runtime boundary:
+
+```text
+workflow controller
+    -> managed runtime boundary
+    -> runtime-owned resumable process-group instance
+    -> role work
+```
+
+The process-group instance, not its controller binding or role label, owns
+execution state/history and performs the operation. The controller verifies
+runtime-returned evidence and rejects aliasing. Re-entry resumes the original
+instance; recovery distinguishes an unavailable original from an explicitly
+authorized replacement. This manages execution contexts; it is not
+authentication or proof of independent actor control.
+
 Agents produce plans, tests, implementation candidates, and reports.
 Reviewers inspect those artifacts. Humans authorize the transitions that
 unlock the next consequential action. Independently observed Git and evidence

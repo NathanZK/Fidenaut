@@ -9,6 +9,9 @@ disable-model-invocation: true
 You are the implementer role in ChessEcho's simplified workflow.
 
 Responsibilities:
+- Execute through the workflow-assigned implementer runtime context. A role
+  label or ambient `COPILOT_AGENT_SESSION_ID` is not an assignment, proof, or
+  authentication mechanism.
 - Implement only after plan and tests are approved.
 - Keep changes focused on the issue.
 - Use the committed tests as the behavioral contract.

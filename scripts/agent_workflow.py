@@ -248,6 +248,190 @@ def _run_root(root, config, issue):
     return _artifact_root(root, config) / ("issue-%s" % issue)
 
 
+ROLE_WORK_STAGES = {
+    "PLANNING": ("planner", "plan", "plan_review"),
+    "PLAN_REVIEW": ("reviewer", "plan_review", "plan"),
+    "TEST_IMPLEMENTATION": ("test_implementer", "test_report", "test_review"),
+    "TEST_REVIEW": ("reviewer", "test_review", "test_report"),
+    "IMPLEMENTATION": ("implementer", "implementation_report", "implementation_review"),
+    "IMPLEMENTATION_REVIEW": ("reviewer", "implementation_review", "implementation_report"),
+}
+
+
+def _managed_role_work(config):
+    return config["workflow"].get("role_execution_contexts", False)
+
+
+def _role_context(root, config, state, role):
+    """Resolve the actual role process, rejecting aliased or unavailable bindings."""
+    contexts = state.setdefault("role_contexts", {})
+    runtime_root = _run_root(root, config, state["issue"]) / "contexts"
+    runtime = workflow_supervisor.ManagedExecutionRuntime(runtime_root)
+    binding = contexts.get(role)
+    if binding is None:
+        binding = runtime.establish(state["issue"], role)
+        contexts[role] = binding
+        _write_state(root, config, state["issue"], state)
+    try:
+        for assigned_role, assigned in contexts.items():
+            if assigned_role == role:
+                continue
+            other = runtime.resume(assigned)
+            _ensure(
+                other["instance_id"] != binding["instance_id"],
+                "role-context-alias",
+                "role contexts resolve to the same execution instance",
+            )
+        runtime.resume(binding)
+    except workflow_supervisor.RuntimeUnavailable as error:
+        _raise("role-context-unavailable", str(error))
+    return runtime, binding
+
+
+def command_run_role(args, root, config):
+    """Run role work in the assigned process, with canonical inputs from state."""
+    state = _read_state(root, config, args.issue)
+    _ensure(_managed_role_work(config), "role-runtime-disabled", "managed role work is not configured")
+    role, output_kind, input_kind = ROLE_WORK_STAGES.get(state["status"], (None, None, None))
+    _ensure(role is not None, "invalid-transition", "no role work is permitted at this gate")
+    _require_role(config, role, args.agent, "run-role")
+    try:
+        command = json.loads(args.role_command)
+    except json.JSONDecodeError as error:
+        _raise("invalid-role-command", "role command must be a JSON argument array: %s" % error)
+    _ensure(
+        isinstance(command, list) and command
+        and all(isinstance(part, str) and part for part in command),
+        "invalid-role-command",
+        "role command must contain nonempty string arguments",
+    )
+    output = pathlib.Path(args.output)
+    if not output.is_absolute():
+        output = root / output
+    output = output.resolve()
+    _ensure(
+        not output.exists() or output.is_file(),
+        "invalid-artifact-output",
+        "role output must be a regular file",
+    )
+    inputs = []
+    artifact = state["artifacts"].get(input_kind)
+    if artifact is not None:
+        _verify_artifact_identity(root, config, args.issue, artifact, "run-role")
+        inputs.append({
+            "kind": input_kind,
+            "path": str((root / artifact["path"]).resolve()),
+            "sha256": artifact["sha256"],
+            "byte_length": artifact["byte_length"],
+        })
+    changed_paths = []
+    for path in args.changed_path:
+        _ensure(
+            role in ("test_implementer", "implementer")
+            and _path_in_scope(path, state.get("approved_scope") or [])
+            and (_is_test_file(path) == (role == "test_implementer")),
+            "role-work-scope-drift",
+            "role work may modify only approved paths assigned to its role",
+        )
+        changed_paths.append(str((root / path).resolve()))
+    runtime, binding = _role_context(root, config, state, role)
+    receipt = runtime.execute(
+        binding, output_kind, {"output": str(output)}, command=command,
+        cwd=root, output=output, inputs=inputs, changed_paths=changed_paths,
+        timeout=_effective_limits(config, "validation")["timeout_ms"] / 1000,
+    )
+    _ensure(
+        receipt.get("instance_id") == binding["instance_id"]
+        and receipt.get("worker_pid") == binding["process_group"]
+        and receipt.get("execution_evidence") == "runtime-executed"
+        and receipt.get("work", {}).get("process_group") == binding["process_group"],
+        "runtime-execution-mismatch",
+        "role work did not execute in its assigned runtime instance",
+    )
+    _ensure(
+        receipt["work"]["exit_code"] == 0 and receipt["work"]["artifact"] is not None,
+        "role-work-failed",
+        "role command failed or did not produce its artifact",
+    )
+    state.setdefault("role_work", {})[output_kind] = {
+        "role": role,
+        "binding": binding["instance_id"],
+        "receipt": receipt,
+    }
+    _write_state(root, config, args.issue, state)
+    return {"ok": True, "status": state["status"], "receipt": receipt}
+
+
+def _require_role_work(root, config, state, role, kind, supplied_path):
+    if not _managed_role_work(config):
+        return
+    work = state.get("role_work", {}).get(kind)
+    binding = state.get("role_contexts", {}).get(role)
+    _ensure(
+        work is not None and binding is not None and work["binding"] == binding["instance_id"]
+        and work["role"] == role,
+        "role-work-missing",
+        "%s must be produced by the assigned %s execution" % (kind, role),
+    )
+    receipt = work["receipt"]
+    recorded = receipt["work"]["artifact"]
+    actual = _resolve_file(root, supplied_path)
+    data = actual.read_bytes()
+    _ensure(
+        str(actual) == recorded["path"]
+        and hashlib.sha256(data).hexdigest() == recorded["sha256"]
+        and len(data) == recorded["byte_length"],
+        "role-work-artifact-mismatch",
+        "%s no longer matches the runtime-produced artifact" % kind,
+    )
+    for consumed in receipt["inputs"]:
+        canonical = state["artifacts"].get(consumed["kind"])
+        _ensure(
+            canonical is not None and canonical["sha256"] == consumed["sha256"]
+            and canonical["byte_length"] == consumed["byte_length"]
+            and str((root / canonical["path"]).resolve()) == consumed["path"],
+            "role-work-input-mismatch",
+            "runtime did not consume the current canonical artifact",
+        )
+        _verify_artifact_identity(root, config, state["issue"], canonical, "submit-role-work")
+    for changed in receipt["work"]["changes"]:
+        source = _resolve_file(root, changed["path"])
+        data = source.read_bytes()
+        _ensure(
+            len(data) == changed["byte_length"]
+            and hashlib.sha256(data).hexdigest() == changed["sha256"],
+            "role-work-candidate-mismatch",
+            "role-produced source changed after execution",
+        )
+
+
+def command_replace_role_context(args, root, config):
+    """Explicitly replace an unavailable execution without rewriting its lineage."""
+    state = _read_state(root, config, args.issue)
+    _ensure(state["status"] in ROLE_WORK_STAGES, "invalid-transition", "role replacement is not available at this gate")
+    role, _, _ = ROLE_WORK_STAGES[state["status"]]
+    _ensure(args.role == role and args.by.strip(), "invalid-role-recovery", "replacement requires the current role and requester")
+    binding = state.get("role_contexts", {}).get(role)
+    _ensure(binding is not None, "missing-role-context", "there is no original role context to replace")
+    runtime = workflow_supervisor.ManagedExecutionRuntime(
+        _run_root(root, config, args.issue) / "contexts"
+    )
+    try:
+        runtime.resume(binding)
+    except workflow_supervisor.RuntimeUnavailable:
+        pass
+    else:
+        _raise("role-context-available", "the original execution is still resumable")
+    replacement = runtime.replace(binding, role)
+    state["role_contexts"][role] = replacement
+    state.setdefault("role_context_replacements", []).append({
+        "role": role, "original": binding["instance_id"],
+        "replacement": replacement["instance_id"], "requested_by": args.by,
+    })
+    _write_state(root, config, args.issue, state)
+    return {"ok": True, "status": state["status"], "replacement": replacement}
+
+
 def _superseded_run_parent(root, config):
     """Return the durable, non-colliding parent directory for retired runs.
 
@@ -5698,6 +5882,7 @@ def command_submit_plan(args, root, config):
     state = _read_state(root, config, args.issue)
     _expect_status(state, "PLANNING", "submit-plan")
     _require_role(config, "planner", args.agent, "submit-plan")
+    _require_role_work(root, config, state, "planner", "plan", args.artifact)
     _ensure(args.scope, "missing-approved-scope", "submit-plan requires at least one approved path")
     state["artifacts"]["plan"] = _record_artifact_with_session_context(
         root, config, args.issue, "plan", args.artifact, observed_session_context
@@ -5718,6 +5903,7 @@ def command_review_plan(args, root, config):
     state = _read_state(root, config, args.issue)
     _expect_status(state, "PLAN_REVIEW", "review-plan")
     _require_role(config, "reviewer", args.reviewer, "review-plan")
+    _require_role_work(root, config, state, "reviewer", "plan_review", args.artifact)
     _ensure(args.status in REVIEW_STATUSES, "invalid-review-status", "Unknown review status")
     review_metadata = _review_session_metadata(state, "plan", reviewer_context)
     review_artifact = _record_artifact(
@@ -5988,6 +6174,7 @@ def command_submit_tests(args, root, config):
     state = _read_state(root, config, args.issue)
     _expect_status(state, "TEST_IMPLEMENTATION", "submit-tests")
     _require_role(config, "test_implementer", args.agent, "submit-tests")
+    _require_role_work(root, config, state, "test_implementer", "test_report", args.artifact)
     if _test_reopen_active(state):
         _require_no_uncommitted_test_changes(root, config, "submit-tests")
     else:
@@ -6125,6 +6312,7 @@ def command_review_tests(args, root, config):
     state = _read_state(root, config, args.issue)
     _expect_status(state, "TEST_REVIEW", "review-tests")
     _require_role(config, "reviewer", args.reviewer, "review-tests")
+    _require_role_work(root, config, state, "reviewer", "test_review", args.artifact)
     _ensure(args.status in REVIEW_STATUSES, "invalid-review-status", "Unknown review status")
     review_metadata = _review_session_metadata(state, "test_report", reviewer_context)
     review_artifact = _record_artifact(
@@ -7025,6 +7213,7 @@ def command_submit_implementation(args, root, config):
         "submit-implementation requires approved tests",
     )
     _require_role(config, "implementer", args.agent, "submit-implementation")
+    _require_role_work(root, config, state, "implementer", "implementation_report", args.artifact)
     test_commit = state.get("test_commit")
     scope = state.get("approved_scope") or []
     _ensure(test_commit, "missing-test-commit", "submit-implementation requires an approved test commit")
@@ -7237,6 +7426,7 @@ def command_review_implementation(args, root, config):
     state = _read_state(root, config, args.issue)
     _expect_status(state, "IMPLEMENTATION_REVIEW", "review-implementation")
     _require_role(config, "reviewer", args.reviewer, "review-implementation")
+    _require_role_work(root, config, state, "reviewer", "implementation_review", args.artifact)
     _ensure(args.status in REVIEW_STATUSES, "invalid-review-status", "Unknown review status")
     review_metadata = _review_session_metadata(
         state, "implementation_report", reviewer_context
@@ -10587,6 +10777,20 @@ def build_parser():
     _add_root(status)
     _add_issue(status)
 
+    run_role = subparsers.add_parser("run-role")
+    _add_root(run_role)
+    _add_issue(run_role)
+    run_role.add_argument("--agent", required=True)
+    run_role.add_argument("--output", required=True)
+    run_role.add_argument("--command", dest="role_command", required=True)
+    run_role.add_argument("--changed-path", action="append", default=[])
+
+    replace_role_context = subparsers.add_parser("replace-role-context")
+    _add_root(replace_role_context)
+    _add_issue(replace_role_context)
+    replace_role_context.add_argument("--role", required=True)
+    replace_role_context.add_argument("--by", required=True)
+
     supersede_run = subparsers.add_parser("supersede-run")
     _add_root(supersede_run)
     _add_issue(supersede_run)
@@ -10803,6 +11007,8 @@ COMMANDS = {
     "init": command_init,
     "start-revision": command_start_revision,
     "status": command_status,
+    "run-role": command_run_role,
+    "replace-role-context": command_replace_role_context,
     "supersede-run": command_supersede_run,
     "submit-plan": command_submit_plan,
     "review-plan": command_review_plan,
