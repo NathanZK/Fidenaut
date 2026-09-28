@@ -345,6 +345,73 @@ def _record_artifact(root, config, issue, kind, supplied_path):
     }
 
 
+def _observe_agent_session_context():
+    """Capture the exact, unauthenticated session value supplied by the runtime."""
+    if "COPILOT_AGENT_SESSION_ID" not in os.environ:
+        return {"available": False, "value": None}
+    return {"available": True, "value": os.environ["COPILOT_AGENT_SESSION_ID"]}
+
+
+def _record_artifact_with_session_context(
+    root, config, issue, kind, supplied_path, observed_session_context
+):
+    artifact = _record_artifact(root, config, issue, kind, supplied_path)
+    artifact["observed_session_context"] = observed_session_context
+    return artifact
+
+
+def _review_session_metadata(state, producer_kind, reviewer_context):
+    """Reject an exact present-context collision for one producer/reviewer pair."""
+    producer = state.get("artifacts", {}).get(producer_kind)
+    _ensure(
+        isinstance(producer, dict),
+        "missing-producer-artifact",
+        "review requires the recorded %s artifact" % producer_kind,
+    )
+    producer_context = producer.get("observed_session_context")
+    if producer_context is None:
+        producer_available = False
+        producer_value = None
+    else:
+        _ensure(
+            isinstance(producer_context, dict)
+            and type(producer_context.get("available")) is bool,
+            "invalid-observed-session-context",
+            "%s artifact has an invalid observed session context" % producer_kind,
+        )
+        producer_available = producer_context["available"]
+        producer_value = producer_context.get("value")
+        _ensure(
+            (producer_available and isinstance(producer_value, str))
+            or (not producer_available and producer_value is None),
+            "invalid-observed-session-context",
+            "%s artifact has an invalid observed session value" % producer_kind,
+        )
+
+    if producer_available and reviewer_context["available"]:
+        _ensure(
+            producer_value != reviewer_context["value"],
+            "review-session-collision",
+            "review rejected because producer and reviewer have the same observed COPILOT_AGENT_SESSION_ID",
+        )
+        signal = "contexts-differed"
+    else:
+        signal = "unavailable"
+    return {
+        "observed_session_context": reviewer_context,
+        "independent_review_signal": signal,
+    }
+
+
+def _copy_recorded_artifact(root, config, issue, kind, artifact):
+    """Copy artifact bytes while preserving its original observed metadata."""
+    copied = _record_artifact(root, config, issue, kind, root / artifact["path"])
+    for key, value in artifact.items():
+        if key not in ("kind", "path", "source", "recorded_at", "sha256", "byte_length"):
+            copied[key] = value
+    return copied
+
+
 def _verify_artifact_identity(root, config, issue, artifact, context):
     """Fail closed when an approval subject differs from its recorded bytes."""
     _ensure(
@@ -5447,8 +5514,8 @@ def _start_revision_run(
         for kind in ("plan", "plan_review", "test_report", "test_review"):
             artifact = parent_state["artifacts"].get(kind)
             if artifact:
-                state["artifacts"][kind] = _record_artifact(
-                    root, config, issue, kind, root / artifact["path"]
+                state["artifacts"][kind] = _copy_recorded_artifact(
+                    root, config, issue, kind, artifact
                 )
         state["approved_scope"] = parent_scope
         state["approvals"]["plan"] = parent_state["approvals"].get("plan")
@@ -5475,8 +5542,8 @@ def _start_revision_run(
         for kind in ("plan", "plan_review"):
             artifact = parent_state["artifacts"].get(kind)
             if artifact:
-                state["artifacts"][kind] = _record_artifact(
-                    root, config, issue, kind, root / artifact["path"]
+                state["artifacts"][kind] = _copy_recorded_artifact(
+                    root, config, issue, kind, artifact
                 )
         state["approved_scope"] = parent_scope
         state["approvals"]["plan"] = parent_state["approvals"].get("plan")
@@ -5627,11 +5694,14 @@ def command_supersede_run(args, root, config):
 
 def command_submit_plan(args, root, config):
     """Store a planner report and bind its approved file scope to the run."""
+    observed_session_context = _observe_agent_session_context()
     state = _read_state(root, config, args.issue)
     _expect_status(state, "PLANNING", "submit-plan")
     _require_role(config, "planner", args.agent, "submit-plan")
     _ensure(args.scope, "missing-approved-scope", "submit-plan requires at least one approved path")
-    state["artifacts"]["plan"] = _record_artifact(root, config, args.issue, "plan", args.artifact)
+    state["artifacts"]["plan"] = _record_artifact_with_session_context(
+        root, config, args.issue, "plan", args.artifact, observed_session_context
+    )
     state["approved_scope"] = args.scope
     state["test_implementation_status"] = (
         "NOT_APPLICABLE" if not any(_is_test_file(path) for path in args.scope) else "REQUIRED"
@@ -5644,13 +5714,17 @@ def command_submit_plan(args, root, config):
 
 def command_review_plan(args, root, config):
     """Store the read-only plan review and route it to approval or revision."""
+    reviewer_context = _observe_agent_session_context()
     state = _read_state(root, config, args.issue)
     _expect_status(state, "PLAN_REVIEW", "review-plan")
     _require_role(config, "reviewer", args.reviewer, "review-plan")
     _ensure(args.status in REVIEW_STATUSES, "invalid-review-status", "Unknown review status")
-    state["artifacts"]["plan_review"] = _record_artifact(
+    review_metadata = _review_session_metadata(state, "plan", reviewer_context)
+    review_artifact = _record_artifact(
         root, config, args.issue, "plan_review", args.artifact
     )
+    review_artifact.update(review_metadata)
+    state["artifacts"]["plan_review"] = review_artifact
     state["status"] = (
         "WAITING_FOR_PLAN_HUMAN_APPROVAL" if args.status == READY else "PLANNING"
     )
@@ -5910,6 +5984,7 @@ def _verify_reopened_test_evidence(root, config, args, state, test_head):
 
 def command_submit_tests(args, root, config):
     """Verify and record a committed tests-only change plus its targeted failure."""
+    observed_session_context = _observe_agent_session_context()
     state = _read_state(root, config, args.issue)
     _expect_status(state, "TEST_IMPLEMENTATION", "submit-tests")
     _require_role(config, "test_implementer", args.agent, "submit-tests")
@@ -5938,8 +6013,13 @@ def command_submit_tests(args, root, config):
             "not-applicable-test-commit-drift",
             "NOT_APPLICABLE requires no test commit or candidate changes",
         )
-        state["artifacts"]["test_report"] = _record_artifact(
-            root, config, args.issue, "test_report", args.artifact
+        state["artifacts"]["test_report"] = _record_artifact_with_session_context(
+            root,
+            config,
+            args.issue,
+            "test_report",
+            args.artifact,
+            observed_session_context,
         )
         _clear_post_tests(state)
         state["test_commit"] = target_head
@@ -6016,8 +6096,13 @@ def command_submit_tests(args, root, config):
         _require_no_uncommitted_test_changes(root, config, "submit-tests after failure check")
     else:
         _require_clean_tree(root, config, "submit-tests after failure check")
-    state["artifacts"]["test_report"] = _record_artifact(
-        root, config, args.issue, "test_report", args.artifact
+    state["artifacts"]["test_report"] = _record_artifact_with_session_context(
+        root,
+        config,
+        args.issue,
+        "test_report",
+        args.artifact,
+        observed_session_context,
     )
     _clear_post_tests(state)
     state["test_commit"] = test_head
@@ -6036,13 +6121,17 @@ def command_submit_tests(args, root, config):
 
 def command_review_tests(args, root, config):
     """Store the read-only test review and route it to approval or revision."""
+    reviewer_context = _observe_agent_session_context()
     state = _read_state(root, config, args.issue)
     _expect_status(state, "TEST_REVIEW", "review-tests")
     _require_role(config, "reviewer", args.reviewer, "review-tests")
     _ensure(args.status in REVIEW_STATUSES, "invalid-review-status", "Unknown review status")
-    state["artifacts"]["test_review"] = _record_artifact(
+    review_metadata = _review_session_metadata(state, "test_report", reviewer_context)
+    review_artifact = _record_artifact(
         root, config, args.issue, "test_review", args.artifact
     )
+    review_artifact.update(review_metadata)
+    state["artifacts"]["test_review"] = review_artifact
     state["status"] = (
         "WAITING_FOR_TEST_HUMAN_APPROVAL" if args.status == READY else "TEST_IMPLEMENTATION"
     )
@@ -6927,6 +7016,7 @@ def command_reclassify_test_reopening(args, root, config):
 
 def command_submit_implementation(args, root, config):
     """Bind the uncommitted production candidate to independently verified Git evidence."""
+    observed_session_context = _observe_agent_session_context()
     state = _read_state(root, config, args.issue)
     _expect_status(state, "IMPLEMENTATION", "submit-implementation")
     _ensure(
@@ -7026,8 +7116,13 @@ def command_submit_implementation(args, root, config):
         % ", ".join(changed_names),
     )
 
-    state["artifacts"]["implementation_report"] = _record_artifact(
-        root, config, args.issue, "implementation_report", args.artifact
+    state["artifacts"]["implementation_report"] = _record_artifact_with_session_context(
+        root,
+        config,
+        args.issue,
+        "implementation_report",
+        args.artifact,
+        observed_session_context,
     )
     candidate_tree = _git_candidate_tree(root, config, test_commit, "submit-implementation")
     state["implementation_candidate"] = {
@@ -7138,13 +7233,19 @@ def command_run_validation(args, root, config):
 
 def command_review_implementation(args, root, config):
     """Record review only after READY candidates still match accepted Git state."""
+    reviewer_context = _observe_agent_session_context()
     state = _read_state(root, config, args.issue)
     _expect_status(state, "IMPLEMENTATION_REVIEW", "review-implementation")
     _require_role(config, "reviewer", args.reviewer, "review-implementation")
     _ensure(args.status in REVIEW_STATUSES, "invalid-review-status", "Unknown review status")
-    state["artifacts"]["implementation_review"] = _record_artifact(
+    review_metadata = _review_session_metadata(
+        state, "implementation_report", reviewer_context
+    )
+    review_artifact = _record_artifact(
         root, config, args.issue, "implementation_review", args.artifact
     )
+    review_artifact.update(review_metadata)
+    state["artifacts"]["implementation_review"] = review_artifact
 
     validated = state.get("validation") or {}
     if args.status == READY:

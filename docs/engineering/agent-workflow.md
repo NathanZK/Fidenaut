@@ -184,6 +184,29 @@ through the applicable governed revision path. It cannot silently inherit an
 approval for earlier bytes, and names such as `plan-final.md` or
 `implementation-v2.md` are not a provenance mechanism.
 
+### Best-effort producer/reviewer context comparison
+
+When a plan, test report, or implementation report is submitted, the workflow
+records whether `COPILOT_AGENT_SESSION_ID` was present and, when present, its
+exact value. The corresponding review command captures its own current value
+before reading the producer observation. If both values are present and
+exactly equal, the review is rejected before its canonical reviewer artifact
+is written or workflow state advances. Otherwise, the accepted review
+artifact records the reviewer's observation and
+`independent_review_signal`: `contexts-differed` only when both values are
+present and unequal, or `unavailable` when either value is unset.
+
+These fields are an unauthenticated, best-effort observation for the
+corresponding plan/review, test-report/review, or implementation-report/review
+pair only. Values are compared exactly as observed, including empty or
+whitespace strings; no normalization or format validation is performed.
+`contexts-differed` and `unavailable` do **not** prove independent execution.
+A caller may deliberately forge or manipulate the environment value. When
+artifacts are reused in a revision, their original context observations and
+review signals are preserved; the copying execution does not become the
+producer or reviewer retroactively. Existing runs without an observation are
+treated as unavailable.
+
 ## Gate sequence
 
 1. `init`
