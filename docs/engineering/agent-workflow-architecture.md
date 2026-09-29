@@ -4,6 +4,9 @@
 > governance model at a high level. It does **not** replace the operational
 > specification in [`agent-workflow.md`](agent-workflow.md), which defines the
 > exact states, commands, evidence, and failure handling.
+>
+> The proposed future boundary between governance and delegated execution is
+> described in [`governance-execution-boundary.md`](governance-execution-boundary.md).
 
 ## Overall workflow
 
