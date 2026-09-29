@@ -29,6 +29,13 @@ CONFIG_FORMAT = "chess-echo-skill-workflow-config-v1"
 READY = "READY_FOR_HUMAN_APPROVAL"
 REVISION = "NEEDS_REVISION"
 REVIEW_STATUSES = (READY, REVISION)
+REVIEW_GATES = {
+    "plan": ("PLANNING", "plan_review"),
+    "tests": ("TEST_IMPLEMENTATION", "test_review"),
+    "implementation": ("IMPLEMENTATION", "implementation_review"),
+}
+DEFAULT_REVISION_LIMIT = 3
+REVISION_CONFIRMATION = "authorize_revision"
 DEFAULT_IMPLEMENTATION_CONFIRMATION = "implementation_approved"
 DEFAULT_SUPERSESSION_CONFIRMATION = "supersede_confirmed"
 DEFAULT_COMPLETED_RUN_RECONCILIATION_CONFIRMATION = "completed_run_reconciled"
@@ -324,6 +331,7 @@ def _command_run_role_locked(args, root, config):
         "--operation-id must be a nonempty string",
     )
     state = _read_state(root, config, args.issue)
+    _require_revision_capacity(state, config)
     _ensure(_managed_role_work(config), "role-runtime-disabled", "managed role work is not configured")
     role, output_kind, input_kind = ROLE_WORK_STAGES.get(state["status"], (None, None, None))
     _ensure(role is not None, "invalid-transition", "no role work is permitted at this gate")
@@ -659,6 +667,26 @@ def _read_state(root, config, issue):
         "invalid-state",
         "Workflow state revision is invalid",
     )
+    # Older runs have no reliable consecutive-review history. Preserve that
+    # uncertainty until this gate is reset by review, fresh entry, or operator.
+    counts = state.setdefault("revision_counts", {gate: None for gate in REVIEW_GATES})
+    _ensure(
+        isinstance(counts, dict)
+        and all(
+            gate in counts
+            and (
+                counts[gate] is None
+                or (
+                    isinstance(counts[gate], int)
+                    and not isinstance(counts[gate], bool)
+                    and counts[gate] >= 0
+                )
+            )
+            for gate in REVIEW_GATES
+        ),
+        "invalid-state",
+        "Workflow review revision counts are invalid",
+    )
     return state
 
 
@@ -715,6 +743,86 @@ def _expect_status(state, expected, operation):
         "%s requires status %s (current: %s)"
         % (operation, expected, state["status"]),
     )
+
+
+def _revision_decision(state, config):
+    for gate, (producer_status, review_kind) in REVIEW_GATES.items():
+        count = state["revision_counts"][gate]
+        limit = config["workflow"]["revision_limit"]
+        if state["status"] == producer_status and (count is None or count >= limit):
+            return {
+                "stopped": True,
+                "gate": gate,
+                "consecutive_count": count,
+                "limit": limit,
+                "review_artifact": state["artifacts"].get(review_kind),
+                "authorization_command": (
+                    "python3 scripts/agent_workflow.py authorize-revision %s "
+                    "--gate %s --by LOGIN --confirm %s"
+                    % (state["issue"], gate, REVISION_CONFIRMATION)
+                ),
+            }
+    return None
+
+
+def _require_revision_capacity(state, config):
+    decision = _revision_decision(state, config)
+    if decision is not None:
+        count = decision["consecutive_count"]
+        _raise(
+            "revision-limit-reached",
+            "Review gate %s has %s consecutive NEEDS_REVISION reviews (limit %s); "
+            "human authorization required: %s"
+            % (decision["gate"], "an unknown number of" if count is None else count,
+               decision["limit"],
+               decision["authorization_command"]),
+        )
+
+
+def _accept_review_revision(state, gate, status):
+    count = state["revision_counts"][gate]
+    state["revision_counts"][gate] = (
+        0 if status == READY else None if count is None else count + 1
+    )
+
+
+def _reset_revision_count(state, gate):
+    state["revision_counts"][gate] = 0
+
+
+def command_authorize_revision(args, root, config):
+    state = _read_state(root, config, args.issue)
+    decision = _revision_decision(state, config)
+    _ensure(
+        decision is not None and decision["gate"] == args.gate,
+        "revision-authorization-not-required",
+        "authorize-revision requires a stopped review gate matching --gate",
+    )
+    _ensure(
+        args.confirm == REVISION_CONFIRMATION,
+        "revision-confirmation-mismatch",
+        "Expected confirmation phrase: %s" % REVISION_CONFIRMATION,
+    )
+    _ensure(
+        args.by.strip(),
+        "missing-revision-requester",
+        "authorize-revision requires a non-empty --by requester",
+    )
+    state.setdefault("revision_authorizations", []).append({
+        "kind": LOCAL_ACKNOWLEDGMENT_KIND,
+        "gate": args.gate,
+        "asserted_by": args.by,
+        "confirmation": args.confirm,
+        "recorded_at": _now(),
+        "independent_authorization": False,
+        "consecutive_count": decision["consecutive_count"],
+        "limit": decision["limit"],
+        "review_artifact": decision["review_artifact"],
+    })
+    _reset_revision_count(state, args.gate)
+    _write_state(root, config, args.issue, state)
+    return {"ok": True, "status": state["status"],
+            "revision_authorization": state["revision_authorizations"][-1]}
 
 
 def _relative(path, root):
@@ -993,6 +1101,12 @@ def _load_config(root):
         == LOCAL_ACKNOWLEDGMENT_KIND,
         "invalid-config",
         "workflow.approval_mechanism must be %s" % LOCAL_ACKNOWLEDGMENT_KIND,
+    )
+    limit = workflow.setdefault("revision_limit", DEFAULT_REVISION_LIMIT)
+    _ensure(
+        isinstance(limit, int) and not isinstance(limit, bool) and limit > 0,
+        "invalid-config",
+        "workflow.revision_limit must be a positive integer",
     )
 
     execution = workflow.get("execution")
@@ -3057,6 +3171,7 @@ def command_recover_implementation_target(args, root, config):
     state["draft_pr"] = None
     state["status"] = materialized["status"]
     if materialized["status"] == "IMPLEMENTATION":
+        _reset_revision_count(state, "implementation")
         state["test_commit"] = materialized["new_test_commit"]
     else:
         state["approvals"]["tests"] = None
@@ -5602,6 +5717,7 @@ def command_init(args, root, config):
         "issue": args.issue,
         "target_base": config["target_base"],
         "status": "PLANNING",
+        "revision_counts": {gate: 0 for gate in REVIEW_GATES},
         "artifacts": {},
         "approvals": {"plan": None, "tests": None, "implementation": None},
         "validation": None,
@@ -5878,6 +5994,7 @@ def _start_revision_run(
         "issue": issue,
         "target_base": config["target_base"],
         "status": REVISION_ENTRY_STATUS[revision_class],
+        "revision_counts": {gate: 0 for gate in REVIEW_GATES},
         "artifacts": {},
         "approvals": {"plan": None, "tests": None, "implementation": None},
         "validation": None,
@@ -6012,6 +6129,7 @@ def command_status(args, root, config):
         "issue": args.issue,
         "run_dir": _relative(_run_root(root, config, args.issue), root),
         "state": state,
+        "revision_decision": _revision_decision(state, config),
     }
 
 
@@ -6102,6 +6220,7 @@ def command_submit_plan(args, root, config):
     observed_session_context = _observe_agent_session_context()
     state = _read_state(root, config, args.issue)
     _expect_status(state, "PLANNING", "submit-plan")
+    _require_revision_capacity(state, config)
     _require_role(config, "planner", args.agent, "submit-plan")
     _require_role_work(root, config, state, "planner", "plan", args.artifact)
     _ensure(args.scope, "missing-approved-scope", "submit-plan requires at least one approved path")
@@ -6135,10 +6254,12 @@ def command_review_plan(args, root, config):
     state["status"] = (
         "WAITING_FOR_PLAN_HUMAN_APPROVAL" if args.status == READY else "PLANNING"
     )
+    _accept_review_revision(state, "plan", args.status)
     if args.status == REVISION:
         _clear_post_plan(state)
     _write_state(root, config, args.issue, state)
     response = {"ok": True, "status": state["status"], "review_status": args.status}
+    response["revision_decision"] = _revision_decision(state, config)
     if state["status"] == "WAITING_FOR_PLAN_HUMAN_APPROVAL":
         command = (
             "python3 scripts/agent_workflow.py approve-plan %s --by LOGIN "
@@ -6174,6 +6295,7 @@ def command_approve_plan(args, root, config):
     )
     acknowledgment = _record_local_acknowledgment(config, state, "plan", args.confirm, args.by)
     state["status"] = "TEST_IMPLEMENTATION"
+    _reset_revision_count(state, "tests")
     _write_state(root, config, args.issue, state)
     return {"ok": True, "status": state["status"], "approval": acknowledgment}
 
@@ -6184,6 +6306,7 @@ def command_reject_plan(args, root, config):
     _expect_status(state, "WAITING_FOR_PLAN_HUMAN_APPROVAL", "reject-plan")
     state["approvals"]["plan"] = None
     _clear_post_plan(state)
+    _reset_revision_count(state, "plan")
     state["status"] = "PLANNING"
     _write_state(root, config, args.issue, state)
     return {"ok": True, "status": state["status"], "reason": args.reason}
@@ -6257,6 +6380,7 @@ def command_request_plan_revision(args, root, config):
     state.setdefault("plan_revision_requests", []).append(request)
     state["approvals"]["plan"] = None
     _clear_post_plan(state)
+    _reset_revision_count(state, "plan")
     state["test_commit"] = None
     state.pop("test_failure", None)
     state["approved_scope"] = None
@@ -6394,6 +6518,7 @@ def command_submit_tests(args, root, config):
     observed_session_context = _observe_agent_session_context()
     state = _read_state(root, config, args.issue)
     _expect_status(state, "TEST_IMPLEMENTATION", "submit-tests")
+    _require_revision_capacity(state, config)
     _require_role(config, "test_implementer", args.agent, "submit-tests")
     _require_role_work(root, config, state, "test_implementer", "test_report", args.artifact)
     if _test_reopen_active(state):
@@ -6544,10 +6669,12 @@ def command_review_tests(args, root, config):
     state["status"] = (
         "WAITING_FOR_TEST_HUMAN_APPROVAL" if args.status == READY else "TEST_IMPLEMENTATION"
     )
+    _accept_review_revision(state, "tests", args.status)
     if args.status == REVISION:
         _clear_post_tests(state)
     _write_state(root, config, args.issue, state)
     response = {"ok": True, "status": state["status"], "review_status": args.status}
+    response["revision_decision"] = _revision_decision(state, config)
     if state["status"] == "WAITING_FOR_TEST_HUMAN_APPROVAL":
         response["approval_gate"] = _approval_gate(
             "tests",
@@ -6858,6 +6985,7 @@ def _persist_finalized_test_transition(root, config, state, journal, authoritati
             ]["recorded_at"]
             state["test_reopenings"][-1]["active"] = False
         state["status"] = "IMPLEMENTATION"
+        _reset_revision_count(state, "implementation")
         _write_state(root, config, state["issue"], state)
     else:
         _ensure(
@@ -7047,6 +7175,7 @@ def command_reject_tests(args, root, config):
     state["approvals"]["tests"] = None
     _clear_post_tests(state)
     state["status"] = "TEST_IMPLEMENTATION"
+    _reset_revision_count(state, "tests")
     _write_state(root, config, args.issue, state)
     return {"ok": True, "status": state["status"], "reason": args.reason}
 
@@ -7094,6 +7223,7 @@ def command_reopen_tests(args, root, config):
     state["artifacts"].pop("test_review", None)
     state["approvals"]["tests"] = None
     state["test_commit"] = None
+    _reset_revision_count(state, "tests")
     _clear_post_tests(state)
     state["status"] = "TEST_IMPLEMENTATION"
     _write_state(root, config, args.issue, state)
@@ -7282,6 +7412,7 @@ def _finalize_test_contract_reopening(root, config, state, journal):
     state.pop("test_failure", None)
     state["approvals"]["tests"] = None
     state["test_commit"] = None
+    _reset_revision_count(state, "tests")
     _clear_post_tests(state)
     state["status"] = "TEST_IMPLEMENTATION"
     _write_state(root, config, state["issue"], state)
@@ -7428,6 +7559,7 @@ def command_submit_implementation(args, root, config):
     observed_session_context = _observe_agent_session_context()
     state = _read_state(root, config, args.issue)
     _expect_status(state, "IMPLEMENTATION", "submit-implementation")
+    _require_revision_capacity(state, config)
     _ensure(
         state["approvals"]["tests"] is not None,
         "tests-not-approved",
@@ -7674,8 +7806,10 @@ def command_review_implementation(args, root, config):
         state["validation"] = None
         state["implementation_candidate"] = None
 
+    _accept_review_revision(state, "implementation", args.status)
     _write_state(root, config, args.issue, state)
     response = {"ok": True, "status": state["status"], "review_status": args.status}
+    response["revision_decision"] = _revision_decision(state, config)
     if state["status"] == "WAITING_FOR_IMPLEMENTATION_HUMAN_APPROVAL":
         response["approval_gate"] = _approval_gate(
             "implementation",
@@ -7815,6 +7949,7 @@ def command_reject_implementation(args, root, config):
     state["validation"] = None
     state["implementation_candidate"] = None
     state["status"] = "IMPLEMENTATION"
+    _reset_revision_count(state, "implementation")
     _write_state(root, config, args.issue, state)
     return {"ok": True, "status": state["status"], "reason": args.reason}
 
@@ -10998,6 +11133,12 @@ def build_parser():
     _add_root(status)
     _add_issue(status)
 
+    authorize_revision = subparsers.add_parser("authorize-revision")
+    _add_root(authorize_revision)
+    _add_issue(authorize_revision)
+    authorize_revision.add_argument("--gate", choices=tuple(REVIEW_GATES), required=True)
+    _add_human(authorize_revision)
+
     run_role = subparsers.add_parser("run-role")
     _add_root(run_role)
     _add_issue(run_role)
@@ -11235,6 +11376,7 @@ COMMANDS = {
     "init": command_init,
     "start-revision": command_start_revision,
     "status": command_status,
+    "authorize-revision": command_authorize_revision,
     "run-role": command_run_role,
     "replace-role-context": command_replace_role_context,
     "supersede-run": command_supersede_run,

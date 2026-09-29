@@ -92,6 +92,277 @@ class AgentWorkflowTest(unittest.TestCase):
         self.provider_manifest_temporary.cleanup()
         self.temporary.cleanup()
 
+    def revision_review(self, gate, status, reviewer_session="reviewer"):
+        producer = {
+            "plan": "plan",
+            "tests": "test_report",
+            "implementation": "implementation_report",
+        }[gate]
+        kind = workflow.REVIEW_GATES[gate][1]
+        state = self.state()
+        state["status"] = {
+            "plan": "PLAN_REVIEW",
+            "tests": "TEST_REVIEW",
+            "implementation": "IMPLEMENTATION_REVIEW",
+        }[gate]
+        producer_path = self.root / "artifacts-src" / (producer + ".md")
+        producer_path.write_text("producer work", encoding="utf-8")
+        state["artifacts"][producer] = workflow._record_artifact(
+            self.root, workflow._load_config(self.root), ISSUE, producer, producer_path
+        )
+        state["artifacts"][producer]["observed_session_context"] = {
+            "available": True, "value": "producer",
+        }
+        if gate == "implementation":
+            state["validation"] = {"passed": True}
+        self.write_state(state)
+        artifact = self.root / "artifacts-src" / (kind + ".md")
+        artifact.write_text("review findings", encoding="utf-8")
+        patches = [mock.patch.object(workflow, "_require_role_work")]
+        if gate == "implementation" and status == workflow.READY:
+            patches.append(mock.patch.object(workflow, "_require_implementation_candidate_matches"))
+        with mock.patch.dict(os.environ, {"COPILOT_AGENT_SESSION_ID": reviewer_session}):
+            return self.run_cli(
+                "review-" + gate, str(ISSUE), "--status", status,
+                "--artifact", str(artifact), "--reviewer", "chess-echo-reviewer",
+                patches=patches,
+            )
+
+    def test_revision_circuit_breaker_at_every_review_gate(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        self.assertEqual(
+            {gate: 0 for gate in workflow.REVIEW_GATES},
+            self.state()["revision_counts"],
+        )
+        for gate, (producer_status, review_kind) in workflow.REVIEW_GATES.items():
+            with self.subTest(gate=gate):
+                state = self.state()
+                state["revision_counts"] = {name: 0 for name in workflow.REVIEW_GATES}
+                self.write_state(state)
+                for count in range(1, 4):
+                    code, result, _ = self.revision_review(gate, workflow.REVISION)
+                    self.assertEqual(0, code, result)
+                    self.assertEqual(producer_status, result["status"])
+                    self.assertEqual(count, self.state()["revision_counts"][gate])
+                    self.assertEqual(count == 3, result["revision_decision"] is not None)
+                    if count == 1:
+                        code, rejected, _ = self.run_cli(
+                            "review-" + gate, str(ISSUE), "--status", workflow.REVISION,
+                            "--artifact", "missing.md", "--reviewer", "chess-echo-reviewer",
+                        )
+                        self.assertEqual(1, code)
+                        self.assertEqual("invalid-transition", rejected["error"]["code"])
+                        code, failed, _ = self.run_cli(
+                            "run-role", str(ISSUE), "--agent", "wrong-role",
+                            "--output", "artifacts-src/failed.md",
+                            "--command", json.dumps([sys.executable, "-c", "raise SystemExit(1)"]),
+                        )
+                        self.assertEqual(1, code)
+                        self.assertEqual(1, self.state()["revision_counts"][gate])
+                code, status, _ = self.run_cli("status", str(ISSUE))
+                self.assertEqual(0, code, status)
+                decision = status["revision_decision"]
+                self.assertEqual(gate, decision["gate"])
+                self.assertEqual(3, decision["consecutive_count"])
+                self.assertEqual(3, decision["limit"])
+                self.assertTrue(decision["stopped"])
+                self.assertEqual(
+                    self.state()["artifacts"][review_kind]["sha256"],
+                    decision["review_artifact"]["sha256"],
+                )
+                output = self.root / "should-not-run.marker"
+                code, denied, _ = self.run_cli(
+                    "run-role", str(ISSUE), "--agent", "chess-echo-" + {
+                        "plan": "planner", "tests": "test-implementer",
+                        "implementation": "implementer",
+                    }[gate], "--output", str(output), "--command",
+                    json.dumps([sys.executable, "-c", "open(%r,'w').write('ran')" % str(output)]),
+                )
+                self.assertEqual(1, code)
+                self.assertEqual("revision-limit-reached", denied["error"]["code"])
+                self.assertFalse(output.exists())
+                submit_args = {
+                    "plan": ["--agent", "chess-echo-planner", "--scope", "src/Foo.kt"],
+                    "tests": ["--agent", "chess-echo-test-implementer"],
+                    "implementation": ["--agent", "chess-echo-implementer"],
+                }[gate]
+                code, denied, _ = self.run_cli(
+                    "submit-" + gate, str(ISSUE), "--artifact", "missing.md", *submit_args
+                )
+                self.assertEqual(1, code)
+                self.assertEqual("revision-limit-reached", denied["error"]["code"])
+                for confirm, requester in (("wrong", "operator"), ("authorize_revision", "")):
+                    code, denied, _ = self.run_cli(
+                        "authorize-revision", str(ISSUE), "--gate", gate,
+                        "--by", requester, "--confirm", confirm,
+                    )
+                    self.assertEqual(1, code)
+                    self.assertEqual(3, self.state()["revision_counts"][gate])
+                code, authorized, _ = self.run_cli(
+                    "authorize-revision", str(ISSUE), "--gate", gate,
+                    "--by", "operator", "--confirm", "authorize_revision",
+                )
+                self.assertEqual(0, code, authorized)
+                self.assertEqual(0, self.state()["revision_counts"][gate])
+                self.assertEqual(3, authorized["revision_authorization"]["consecutive_count"])
+                self.assertEqual(
+                    decision["review_artifact"]["sha256"],
+                    authorized["revision_authorization"]["review_artifact"]["sha256"],
+                )
+                self.assertIsNone(self.run_cli("status", str(ISSUE))[1]["revision_decision"])
+                self.assertEqual(1, self.run_cli(
+                    "authorize-revision", str(ISSUE), "--gate", gate,
+                    "--by", "operator", "--confirm", "authorize_revision",
+                )[0])
+
+    def test_revision_ready_and_rejected_review_do_not_accumulate(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        for gate in workflow.REVIEW_GATES:
+            with self.subTest(gate=gate):
+                state = self.state()
+                state["revision_counts"][gate] = 2
+                self.write_state(state)
+                code, rejected, _ = self.revision_review(
+                    gate, workflow.REVISION, reviewer_session="producer"
+                )
+                self.assertEqual(1, code)
+                self.assertEqual("review-session-collision", rejected["error"]["code"])
+                self.assertEqual(2, self.state()["revision_counts"][gate])
+                code, ready, _ = self.revision_review(gate, workflow.READY)
+                self.assertEqual(0, code, ready)
+                self.assertTrue(ready["status"].startswith("WAITING_FOR_"))
+                self.assertEqual(0, self.state()["revision_counts"][gate])
+
+    def test_revision_limit_config_missing_is_bounded_and_invalid_fails(self):
+        config_path = self.root / ".github" / "agent-workflow.json"
+        config = json.loads(config_path.read_text())
+        self.assertEqual(3, workflow._load_config(self.root)["workflow"]["revision_limit"])
+        for invalid in (0, -1, True, "unlimited", None):
+            with self.subTest(invalid=invalid):
+                config["workflow"]["revision_limit"] = invalid
+                config_path.write_text(json.dumps(config))
+                code, payload, _ = self.run_cli("init", str(ISSUE))
+                self.assertEqual(1, code)
+                self.assertEqual("invalid-config", payload["error"]["code"])
+
+    def test_recovered_role_receipt_and_repeated_review_do_not_double_count(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        state = self.state()
+        state["revision_counts"]["plan"] = 1
+        self.write_state(state)
+        plan, original = self.execute_role_artifact(
+            "planner", "plan.md", "plan", operation_id="same-plan-operation"
+        )
+        _, recovered = self.execute_role_artifact(
+            "planner", "plan.md", "plan", operation_id="same-plan-operation"
+        )
+        self.assertEqual(original["history_length"], recovered["history_length"])
+        self.assertEqual(1, self.state()["revision_counts"]["plan"])
+        self.assertEqual(0, self.run_cli_with_session(
+            "producer", "submit-plan", str(ISSUE), "--artifact", plan,
+            "--agent", "chess-echo-planner", "--scope", "src/Foo.kt",
+        )[0])
+        review, _ = self.execute_role_artifact("reviewer", "plan-review.md", "findings")
+        args = (
+            "review-plan", str(ISSUE), "--status", workflow.REVISION,
+            "--artifact", review, "--reviewer", "chess-echo-reviewer",
+        )
+        self.assertEqual(0, self.run_cli_with_session("reviewer", *args)[0])
+        self.assertEqual(2, self.state()["revision_counts"]["plan"])
+        code, rejected, _ = self.run_cli_with_session("reviewer", *args)
+        self.assertEqual(1, code)
+        self.assertEqual("invalid-transition", rejected["error"]["code"])
+        self.assertEqual(2, self.state()["revision_counts"]["plan"])
+        self.addCleanup(self.stop_role_contexts)
+
+    def test_legacy_revision_counts_fail_closed_until_explicit_authorization(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        self.assertEqual(
+            {gate: 0 for gate in workflow.REVIEW_GATES},
+            self.state()["revision_counts"],
+        )
+        for gate, (producer_status, _) in workflow.REVIEW_GATES.items():
+            with self.subTest(gate=gate):
+                state = self.state()
+                state.pop("revision_counts", None)
+                state["status"] = producer_status
+                self.write_state(state)
+                code, status, _ = self.run_cli("status", str(ISSUE))
+                self.assertEqual(0, code, status)
+                self.assertEqual(
+                    {name: None for name in workflow.REVIEW_GATES},
+                    status["state"]["revision_counts"],
+                )
+                self.assertIsNone(status["revision_decision"]["consecutive_count"])
+                marker = self.root / "should-not-run.marker"
+                code, denied, _ = self.run_cli(
+                    "run-role", str(ISSUE), "--agent", "chess-echo-" + {
+                        "plan": "planner", "tests": "test-implementer",
+                        "implementation": "implementer",
+                    }[gate], "--output", str(marker), "--command",
+                    json.dumps([sys.executable, "-c", "open(%r, 'w').close()" % str(marker)]),
+                )
+                self.assertEqual(1, code)
+                self.assertEqual("revision-limit-reached", denied["error"]["code"])
+                self.assertFalse(marker.exists())
+                code, authorized, _ = self.run_cli(
+                    "authorize-revision", str(ISSUE), "--gate", gate,
+                    "--by", "operator", "--confirm", "authorize_revision",
+                )
+                self.assertEqual(0, code, authorized)
+                self.assertIsNone(authorized["revision_authorization"]["consecutive_count"])
+                self.assertEqual(0, self.state()["revision_counts"][gate])
+                self.assertEqual(
+                    {name: None for name in workflow.REVIEW_GATES if name != gate},
+                    {name: count for name, count in self.state()["revision_counts"].items()
+                     if name != gate},
+                )
+                self.assertIsNone(self.run_cli("status", str(ISSUE))[1]["revision_decision"])
+
+    def test_legacy_review_needs_revision_preserves_unknown_count(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        state = self.state()
+        state.pop("revision_counts")
+        self.write_state(state)
+        code, review, _ = self.revision_review("plan", workflow.REVISION)
+        self.assertEqual(0, code, review)
+        self.assertIsNone(self.state()["revision_counts"]["plan"])
+        self.assertEqual("plan", review["revision_decision"]["gate"])
+        self.assertEqual("revision-limit-reached", self.run_cli(
+            "submit-plan", str(ISSUE), "--artifact", "missing.md",
+            "--agent", "chess-echo-planner", "--scope", "src/Foo.kt",
+        )[1]["error"]["code"])
+
+    def test_implementation_target_recovery_resets_only_implementation_count(self):
+        original_run_cli = self.run_cli
+
+        def distinct_fixture_sessions(*arguments, **kwargs):
+            if arguments[0].startswith("review-"):
+                with mock.patch.dict(os.environ, {"COPILOT_AGENT_SESSION_ID": "reviewer-fixture"}):
+                    return original_run_cli(*arguments, **kwargs)
+            if arguments[0].startswith("submit-"):
+                with mock.patch.dict(os.environ, {"COPILOT_AGENT_SESSION_ID": "producer-fixture"}):
+                    return original_run_cli(*arguments, **kwargs)
+            return original_run_cli(*arguments, **kwargs)
+
+        with mock.patch.object(self, "run_cli", side_effect=distinct_fixture_sessions):
+            self.bootstrap_to_validation()
+        self.assertEqual(0, self.run_cli(
+            "run-validation", str(ISSUE), "--profile", "workflow-tooling",
+        )[0])
+        state = self.state()
+        state["revision_counts"] = {"plan": 2, "tests": 1, "implementation": 2}
+        self.write_state(state)
+        self.advance_remote_target_over_candidate(content="remote overlap\n")
+        code, recovered, _ = self.recover_implementation_target()
+        self.assertEqual(0, code, recovered)
+        self.assertEqual("IMPLEMENTATION", recovered["status"])
+        self.assertEqual(
+            {"plan": 2, "tests": 1, "implementation": 0},
+            self.state()["revision_counts"],
+        )
+
     def test_reviewer_contract_requires_direct_acceptance_criterion_evidence(self):
         reviewer_contract = (
             pathlib.Path(__file__).resolve().parents[2]
