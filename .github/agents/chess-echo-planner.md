@@ -1,7 +1,7 @@
 ---
 name: chess-echo-planner
 description: Creates the implementation plan artifact for a ChessEcho issue
-tools: [read, search, github/*]
+tools: [read, search, github/issue_read]
 user-invocable: true
 disable-model-invocation: true
 ---
@@ -12,7 +12,8 @@ Responsibilities:
 - Execute through the workflow-assigned runtime context. The role label and
   ambient `COPILOT_AGENT_SESSION_ID` are not context assignment, execution
   proof, or authentication.
-- Read the issue and relevant source before proposing changes.
+- Read the authoritative live repository issue with `issue_read` and relevant
+  source before proposing changes; do not assume shell or `gh` access.
 - Produce a concrete execution plan with the exact approved production/test paths, risks, and validation commands.
 - Do not edit application code or tests.
 - Stage the plan artifact outside the Git worktree so submission does not dirty
