@@ -582,6 +582,116 @@ def command_replace_role_context(args, root, config):
         return _command_replace_role_context_locked(args, root, config)
 
 
+def _reconcile_replaced_pending_role_work(
+    state, role, output_kind, original, replacement
+):
+    pending_work = state.get("role_work_pending")
+    if not pending_work:
+        return None
+    _ensure(
+        isinstance(pending_work, dict),
+        "role-work-reconciliation-mismatch",
+        "pending role operation evidence is malformed",
+    )
+    pending = pending_work.get(output_kind)
+    _ensure(
+        pending is None or isinstance(pending, dict),
+        "role-work-reconciliation-mismatch",
+        "pending role operation evidence is malformed",
+    )
+    if pending is None:
+        return None
+
+    _ensure(
+        pending.get("role") == role
+        and pending.get("binding") == original["instance_id"]
+        and pending.get("operation") == output_kind
+        and isinstance(pending.get("request_id"), str)
+        and isinstance(pending.get("request_sha256"), str)
+        and isinstance(pending.get("output"), str),
+        "role-work-reconciliation-mismatch",
+        "pending role operation is not bound to the replaced context",
+    )
+    history_path = pathlib.Path(original.get("history_path", ""))
+    _ensure(
+        history_path.is_file(),
+        "role-work-reconciliation-mismatch",
+        "original role context history is missing",
+    )
+    try:
+        history = json.loads(history_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        _raise(
+            "role-work-reconciliation-mismatch",
+            "original role context history is unreadable: %s" % error,
+        )
+    _ensure(
+        isinstance(history, list),
+        "role-work-reconciliation-mismatch",
+        "original role context history is malformed",
+    )
+    matches = [
+        entry for entry in history
+        if isinstance(entry, dict)
+        and entry.get("request_id") == pending["request_id"]
+    ]
+    _ensure(
+        len(matches) == 1,
+        "role-work-reconciliation-mismatch",
+        "pending role operation does not have one matching history entry",
+    )
+    entry = matches[0]
+    receipt = entry.get("receipt")
+    work = entry.get("work")
+    _ensure(
+        entry.get("request_sha256") == pending["request_sha256"]
+        and entry.get("instance_id") == original["instance_id"]
+        and entry.get("role") == role
+        and entry.get("execution_scope") == original["execution_scope"]
+        and entry.get("operation") == output_kind
+        and isinstance(entry.get("payload"), dict)
+        and entry["payload"].get("output") == pending["output"]
+        and entry.get("status") == "completed"
+        and isinstance(receipt, dict)
+        and receipt.get("instance_id") == original["instance_id"]
+        and receipt.get("role") == role
+        and receipt.get("execution_scope") == original["execution_scope"]
+        and receipt.get("request_id") == pending["request_id"]
+        and receipt.get("request_sha256") == pending["request_sha256"]
+        and receipt.get("operation") == output_kind
+        and receipt.get("execution_evidence") == "runtime-executed"
+        and receipt.get("work") == work
+        and isinstance(work, dict)
+        and work.get("exit_code") == 0
+        and work.get("artifact") is None
+        and work.get("changes") == [],
+        "role-work-reconciliation-mismatch",
+        "pending role operation lacks proof of a completed no-op",
+    )
+    pending_work.pop(output_kind)
+    if not pending_work:
+        state.pop("role_work_pending", None)
+    state.setdefault("role_work_reconciliations", []).append({
+        "format": "managed-role-work-reconciliation-v1",
+        "role": role,
+        "operation": output_kind,
+        "request_id": pending["request_id"],
+        "request_sha256": pending["request_sha256"],
+        "original_binding": original["instance_id"],
+        "replacement_binding": replacement["instance_id"],
+        "history_path": str(history_path),
+        "history_entry": {
+            "status": entry["status"],
+            "exit_code": work["exit_code"],
+            "artifact": work["artifact"],
+            "changes": work["changes"],
+        },
+        "reason": "completed exit-0 operation produced no artifact or changes",
+        "recorded_at": _now(),
+    })
+    return pending["request_id"]
+
+
 def _command_replace_role_context_locked(args, root, config):
     """Explicitly replace an unavailable execution without rewriting its lineage."""
     state = _read_state(root, config, args.issue)
@@ -606,13 +716,24 @@ def _command_replace_role_context_locked(args, root, config):
     else:
         _raise("role-context-available", "the original execution is still resumable")
     replacement = runtime.replace(binding, role)
+    output_kind = ROLE_WORK_STAGES[state["status"]][1]
+    try:
+        reconciled_request_id = _reconcile_replaced_pending_role_work(
+            state, role, output_kind, binding, replacement
+        )
+    except WorkflowError:
+        runtime.stop(replacement)
+        raise
     state["role_contexts"][role] = replacement
     state.setdefault("role_context_replacements", []).append({
         "role": role, "original": binding["instance_id"],
         "replacement": replacement["instance_id"], "requested_by": args.by,
     })
     _write_state(root, config, args.issue, state)
-    return {"ok": True, "status": state["status"], "replacement": replacement}
+    response = {"ok": True, "status": state["status"], "replacement": replacement}
+    if reconciled_request_id is not None:
+        response["reconciled_pending_operation"] = reconciled_request_id
+    return response
 
 
 def _superseded_run_parent(root, config):

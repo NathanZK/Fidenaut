@@ -659,6 +659,127 @@ class AgentWorkflowTest(unittest.TestCase):
         self.execute_role_artifact("planner", "plan.md", "replacement")
         self.assertEqual(1, self.state()["role_work"]["plan"]["receipt"]["history_length"])
 
+    def prepare_stale_pending_plan(
+        self, *, history=True, receipt=True, identity=True, exit_code=0,
+        artifact=None, changes=None
+    ):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        runtime_root = (
+            self.root / ".agent-workflow" / "runs" / f"issue-{ISSUE}" / "contexts"
+        )
+        runtime = workflow.workflow_supervisor.ManagedExecutionRuntime(runtime_root)
+        binding = runtime.establish(ISSUE, "planner")
+        state = self.state()
+        state["role_contexts"] = {"planner": binding}
+        runtime.stop(binding)
+        output = self.root / "artifacts-src" / "plan.md"
+        request = runtime._execution_request(
+            binding,
+            "plan",
+            {"output": str(output)},
+            command=[sys.executable, "-c", "pass"],
+            cwd=self.root,
+            output=output,
+            timeout=5,
+            request_id="stale-plan-operation",
+        )
+        state["role_work_pending"] = {
+            "plan": {
+                "role": "planner",
+                "binding": binding["instance_id"],
+                "operation": "plan",
+                "output": str(output),
+                "request_id": request["request_id"],
+                "request_sha256": (
+                    request["request_sha256"] if identity else "0" * 64
+                ),
+            }
+        }
+        self.write_state(state)
+        if history:
+            work = {
+                "pid": binding["process_group"],
+                "process_group": binding["process_group"],
+                "exit_code": exit_code,
+                "artifact": artifact,
+                "changes": [] if changes is None else changes,
+            }
+            entry = {
+                "request_id": request["request_id"],
+                "request_sha256": request["request_sha256"],
+                "instance_id": binding["instance_id"],
+                "role": "planner",
+                "execution_scope": str(ISSUE),
+                "operation": "plan",
+                "payload": {"output": str(output)},
+                "status": "completed",
+                "work": work,
+            }
+            if receipt:
+                entry["receipt"] = {
+                    "instance_id": binding["instance_id"],
+                    "role": "planner",
+                    "execution_scope": str(ISSUE),
+                    "request_id": request["request_id"],
+                    "request_sha256": request["request_sha256"],
+                    "history_length": 1,
+                    "operation": "plan",
+                    "execution_evidence": "runtime-executed",
+                    "worker_pid": binding["process_group"],
+                    "inputs": [],
+                    "work": work,
+                }
+            pathlib.Path(binding["history_path"]).write_text(
+                json.dumps([entry]), encoding="utf-8"
+            )
+        return binding, output
+
+    def replace_stale_pending_plan(self):
+        return self.run_cli(
+            "replace-role-context", str(ISSUE), "--role", "planner", "--by", "operator"
+        )
+
+    def test_replacement_reconciles_completed_noop_and_allows_fresh_work(self):
+        original, _ = self.prepare_stale_pending_plan()
+        code, result, _ = self.replace_stale_pending_plan()
+        self.assertEqual(0, code, result)
+        state = self.state()
+        replacement = state["role_contexts"]["planner"]
+        self.assertNotEqual(original["instance_id"], replacement["instance_id"])
+        self.assertEqual(original["instance_id"], replacement["replaces"])
+        self.assertNotIn("role_work_pending", state)
+        audit = state["role_work_reconciliations"][0]
+        self.assertEqual("stale-plan-operation", audit["request_id"])
+        self.assertEqual(original["instance_id"], audit["original_binding"])
+        self.assertEqual(replacement["instance_id"], audit["replacement_binding"])
+        self.assertEqual("completed exit-0 operation produced no artifact or changes", audit["reason"])
+        self.execute_role_artifact("planner", "plan.md", "fresh replacement work")
+        self.assertEqual(1, self.state()["role_work"]["plan"]["receipt"]["history_length"])
+
+    def test_replacement_keeps_pending_when_noop_evidence_is_unsafe(self):
+        cases = (
+            {"artifact": {"path": "artifact", "sha256": "0" * 64, "byte_length": 8}},
+            {"exit_code": 1},
+            {"history": False},
+            {"receipt": False},
+            {"identity": False},
+            {"changes": [{"path": "src/changed.py"}]},
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                self.tearDown()
+                self.setUp()
+                original, _ = self.prepare_stale_pending_plan(**case)
+                before = self.state()["role_work_pending"]["plan"]
+                code, result, _ = self.replace_stale_pending_plan()
+                self.assertEqual(1, code, result)
+                self.assertEqual("role-work-reconciliation-mismatch", result["error"]["code"])
+                state = self.state()
+                self.assertEqual(before, state["role_work_pending"]["plan"])
+                self.assertEqual(original["instance_id"], state["role_contexts"]["planner"]["instance_id"])
+                self.assertNotIn("role_work_reconciliations", state)
+
     def test_replacement_rejects_a_busy_original_execution_context(self):
         self.enable_role_execution()
         self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
