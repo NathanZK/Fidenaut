@@ -241,7 +241,9 @@ human approval.
 Given an issue number, run the same governed sequence autonomously through
 planning, implementation, review, and validation. When any
 `WAITING_FOR_*_HUMAN_APPROVAL` state is reached, stop and wait for explicit
-human approval; do not self-attest past that gate. Do not merge.
+human approval; do not self-attest past that gate. Also stop when a review
+reaches the non-convergence revision limit; an operator must explicitly
+authorize further revision before producer work resumes. Do not merge.
 
 The repository-level `.github/PULL_REQUEST_TEMPLATE.md` is reusable,
 human-facing scaffolding for ordinary pull requests. Its `What`, `Why`, and
@@ -342,6 +344,7 @@ stateDiagram-v2
     PLANNING --> PLAN_REVIEW: submit-plan
     PLAN_REVIEW --> WAITING_FOR_PLAN_HUMAN_APPROVAL: review-plan READY
     PLAN_REVIEW --> PLANNING: review-plan NEEDS_REVISION
+    PLANNING --> PLANNING: revision limit stops producer until authorize-revision
     WAITING_FOR_PLAN_HUMAN_APPROVAL --> TEST_IMPLEMENTATION: approve-plan (Approval Gate 1)
     WAITING_FOR_PLAN_HUMAN_APPROVAL --> PLANNING: reject-plan
 
@@ -350,6 +353,7 @@ stateDiagram-v2
     TEST_IMPLEMENTATION --> TEST_REVIEW: submit-tests (NOT_APPLICABLE) records approved rationale
     TEST_REVIEW --> WAITING_FOR_TEST_HUMAN_APPROVAL: review-tests READY
     TEST_REVIEW --> TEST_IMPLEMENTATION: review-tests NEEDS_REVISION
+    TEST_IMPLEMENTATION --> TEST_IMPLEMENTATION: revision limit stops producer until authorize-revision
     WAITING_FOR_TEST_HUMAN_APPROVAL --> IMPLEMENTATION: approve-tests creates test boundary (Approval Gate 2)
     WAITING_FOR_TEST_HUMAN_APPROVAL --> TEST_IMPLEMENTATION: reject-tests
 
@@ -365,6 +369,7 @@ stateDiagram-v2
     VALIDATION --> IMPLEMENTATION: validation failure or candidate drift
     IMPLEMENTATION_REVIEW --> WAITING_FOR_IMPLEMENTATION_HUMAN_APPROVAL: review-implementation READY after candidate revalidation
     IMPLEMENTATION_REVIEW --> IMPLEMENTATION: review-implementation NEEDS_REVISION
+    IMPLEMENTATION --> IMPLEMENTATION: revision limit stops producer until authorize-revision
     WAITING_FOR_IMPLEMENTATION_HUMAN_APPROVAL --> DRAFT_PR_CREATION: approve-implementation creates implementation commit (Approval Gate 3)
     WAITING_FOR_IMPLEMENTATION_HUMAN_APPROVAL --> DRAFT_PR_CREATION: reconcile-implementation-target re-applies a committed candidate onto an advanced target
     DRAFT_PR_CREATION --> DRAFT_PR_CREATION: reconcile-implementation-target --confirm implementation_target_reconciliation_reanchored re-anchors a materialized reconciliation onto a further advance
@@ -1328,11 +1333,34 @@ digests, and issue #7 collision detection.
 All external commands run via `scripts/workflow_supervisor.py` with configured timeout, grace period, and output caps.
 The complete configured Python workflow suite is the workflow-tooling gate; focused tests are useful during implementation but never replace governed validation.
 
+`workflow.revision_limit` is a positive integer; when omitted its default is
+**3**. Invalid values fail configuration validation. Each governed run starts
+with zero consecutive accepted `NEEDS_REVISION` reviews at each of the plan,
+tests, and implementation gates. Only acceptance of a review increments its
+gate's counter; rejected reviews, failed role work, retries and receipt
+recovery do not. `READY_FOR_HUMAN_APPROVAL`, explicit revision authorization,
+and legitimate fresh entry into a gate reset the applicable counter.
+For runs persisted before counters existed, the historical counts remain
+unknown (shown as `null`), never assumed to be zero. An unknown count stops
+producer work at that gate until the operator explicitly authorizes revision;
+an accepted `NEEDS_REVISION` review cannot erase that uncertainty.
+
+At the limit, the accepted review retains the usual producer status but
+`run-role` and the gate's `submit-*` command fail with
+`revision-limit-reached` before dispatch or resubmission. The review response
+and `status` expose `revision_decision` with gate, count, limit, latest
+recorded review artifact identity and authorization command. The operator
+inspects that review and may use `authorize-revision` with an asserted
+requester and exact confirmation phrase to reset the counter and allow another
+bounded sequence. This is a local self-attested decision, not authenticated
+human approval, and does not change any existing approval gate.
+
 ## Commands
 
 ```bash
 python3 scripts/agent_workflow.py init ISSUE
 python3 scripts/agent_workflow.py status ISSUE
+python3 scripts/agent_workflow.py authorize-revision ISSUE --gate plan|tests|implementation --by LOGIN --confirm authorize_revision
 python3 scripts/agent_workflow.py run-role ISSUE --agent ROLE --output PATH --command '["executable","argument",...]' [--operation-id ID]
 python3 scripts/agent_workflow.py replace-role-context ISSUE --role ROLE --by REQUESTER
 python3 scripts/agent_workflow.py supersede-run ISSUE --by REQUESTER --reason "..." --confirm supersede_confirmed

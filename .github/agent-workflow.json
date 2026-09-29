@@ -5,6 +5,7 @@
     "format": "chess-echo-skill-workflow-config-v1",
     "run_root": ".agent-workflow/runs",
     "role_execution_contexts": true,
+    "revision_limit": 3,
     "roles": {
       "planner": "chess-echo-planner",
       "reviewer": "chess-echo-reviewer",
