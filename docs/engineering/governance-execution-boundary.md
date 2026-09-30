@@ -3,6 +3,10 @@
 > **Status:** architecture proposal for review. This document does not
 > authorize an implementation, select an execution provider, or change the
 > current workflow.
+>
+> The narrower, experiment-derived boundary and minimum executor semantics
+> are proposed in
+> [`external-executor-contract.md`](external-executor-contract.md).
 
 ## Purpose
 
@@ -33,9 +37,13 @@ Fidenaut runtime problem: the completed nonzero operation has no governed retry
 path.
 
 This is an architectural observation, not authorization to add retry behavior.
-Under the proposed boundary, provider-level retries and recovery would belong
-to the executor. Fidenaut would remain blocked until the executor supplied
-evidence that Fidenaut independently accepted.
+Under a possible delegated boundary, the executor would run operations and
+expose outcomes and artifacts under the protocol in
+[`external-executor-contract.md`](external-executor-contract.md). Fidenaut
+would remain blocked until it recovered and independently accepted adequate
+evidence. Whether an executor may retry internally, and under what conditions,
+is constrained by that contract's operation identity and side-effect rules;
+Fidenaut never delegates workflow authorization to an executor.
 
 ## Fidenaut governance/control plane
 
@@ -59,69 +67,53 @@ not approval.
 
 ## External execution layer
 
-The execution provider is responsible for:
+An external execution layer, if selected, would run agents and their tools,
+manage its own provider/runtime details, and expose context, operation,
+outcome, and artifact behavior meeting the normative minimum contract in
+[`external-executor-contract.md`](external-executor-contract.md). Its
+internals—queues, process lifecycle, persistence mechanisms, retry
+algorithms, and protocols—are not prescribed. It must not make workflow
+decisions for Fidenaut. Cancellation is optional; executor forks are not a
+required boundary operation. Fidenaut independently validates returned
+evidence and decides whether any workflow transition is permitted.
 
-- creating, resuming, and forking execution contexts;
-- running agents and their tools;
-- model and provider interaction;
-- process, sandbox, and runtime lifecycle;
-- provider-level retries and timeout handling;
-- execution recovery and response persistence;
-- cancellation;
-- internal execution history and persistence needed for those operations.
+## Normative external-executor contract
 
-Fidenaut should not need to understand provider-specific failure mechanisms,
-process groups, sockets, or model-catalog behavior. It may classify an outcome
-as acceptable or unacceptable for a governed transition, but it should not
-have to implement the provider's retry protocol.
+[`external-executor-contract.md`](external-executor-contract.md) defines the
+minimum proposed protocol semantics, operation identity and recovery rules,
+context requirements, artifact boundary, outcome model, exclusions, and
+unresolved decisions. It is normative for this architecture proposal;
+summaries elsewhere in this document do not add to or override it.
 
-## Conceptual executor contract
-
-The names below are illustrative. The required semantics matter more than a
-particular API or wire protocol.
-
-| Operation | Fidenaut needs to know | Executor remains responsible for |
-| --- | --- | --- |
-| Create context | A newly created context identifier, its role/scope metadata, and any declared parent/lineage reference | Allocating isolated context state and making the new context usable |
-| Resume context | Whether the requested identifier resumed, is unavailable, or was replaced; never a silent substitute | Restoring the same context's state and reporting availability |
-| Fork or replace context | A distinct new identifier and explicit parent/replacement lineage | Copying or rebuilding whatever state is permitted, without disguising the child as the original |
-| Run operation | Stable operation identifier, context identifier, outcome status, returned artifacts/results, and executor event reference where available | Running the agent, provider calls, timeouts, retries, and internal operation durability |
-| Fetch outcome | The same operation's durable outcome, or an explicit unknown/unavailable result; no accidental re-execution | Persisting and looking up outcomes idempotently after response loss |
-| Cancel | Whether cancellation was accepted, completed, or remains unknown | Stopping the operation and handling races with completion |
-
-The contract must support at least these outcome distinctions:
-
-- succeeded with returned result/artifact data;
-- failed because of agent work;
-- failed because of a transient or permanent provider/runtime problem;
-- cancelled;
-- unknown or unavailable.
-
-An unknown outcome must make Fidenaut fail closed. Fidenaut may authorize a
-new operation after a classified transient failure, subject to its own
-governed limits, but it must not silently reinterpret an unknown operation as
-safe to repeat.
+The current conceptual operation names are create context, resume context,
+run operation, fetch outcome, and optional cancel operation. Replacement is a
+Fidenaut-governed creation of a distinct context with lineage recorded by
+Fidenaut; executor fork semantics are not required. The executor contract
+does not prescribe internal implementation or guarantee that arbitrary
+external side effects are transactional.
 
 ### IDs, roles, and lineage
 
-Fidenaut supplies or records a governed operation identity and binds the
-operation to a workflow, role, and context reference. The executor supplies
-execution and context identifiers and must preserve their meaning across
-resume, fork, and outcome lookup. A context identifier is a reference, not
-proof of independent actor identity.
-
-The executor may expose richer event history or lineage, but Fidenaut must
-record enough information to determine which context was assigned to which
-role, which context produced an artifact, and whether a replacement is a new
-identity. A fork or replacement must never be presented as a continuation of
-the original context merely because it inherited state.
+Fidenaut assigns the operation identity and binds it to a workflow, role, and
+context reference. The executor must preserve that operation identity and the
+exact context meaning defined in the normative contract across resume and
+outcome lookup. A context identifier is evidence/reference, not proof of
+independent actor identity or isolation.
+Fidenaut records which context was assigned to each role, which context
+produced an artifact, and whether a replacement is a new identity. Any
+executor context lineage is supplemental evidence; replacement lineage and
+authorization remain Fidenaut-owned.
 
 ### Artifact transfer
 
-The executor can return files, diffs, reports, or content-addressed references.
-Fidenaut copies or retrieves the bytes into its canonical artifact store and
-recomputes their digest and length. Only bytes received and re-hashed by
-Fidenaut count as governed artifact evidence.
+The executor may return files, diffs, reports, or content-addressed references
+only in a form that meets the artifact requirements in the normative
+contract, including an explicit completeness assertion for repository
+changes. Fidenaut obtains the actual bytes into its canonical artifact store
+and recomputes their digest and length; executor-provided hashes are claims,
+not authoritative values. Only bytes received and independently verified by
+Fidenaut count as governed artifact evidence. An absent or incomplete
+retrieval is not evidence of no changes.
 
 Repository changes remain subject to Fidenaut's independent scope, path, Git,
 and validation checks. An executor-authored report describing a change is not
@@ -137,10 +129,10 @@ executor responses as claims and inputs to independent checks.
 | Artifact bytes and digest | Re-read bytes, hash them, and store them canonically | That the executor selected the intended source before transfer |
 | Source changes and scope | Compute and inspect Git changes against approved paths | That the executor's internal workspace was the one it reports |
 | Validation result | Run required validation or inspect independently captured evidence | That an executor-reported test ran in the claimed environment |
-| Operation status | Require a durable outcome and reject unknown/malformed results | The executor's classification of provider vs. agent failure |
+| Operation status | Require a durable operation observation/outcome and reject unknown or malformed results | The executor's classification of provider vs. agent failure |
 | Context relationship | Compare recorded IDs and lineage and reject collisions | That distinct IDs represent genuinely distinct state and no hidden shared history |
-| Same-role resumption | Check that the bound ID is returned on resume | That the executor restored the same context state |
-| Replacement lineage | Record the new ID and parent relationship | That the executor did not silently reuse the old context's state |
+| Same-role resumption | Check that the bound ID is returned on resume | That the executor restored the exact same context state, subject to qualification evidence |
+| Replacement lineage | Record the new ID, old binding, reason, and authorization | That the new context has the qualified isolation properties required for its role |
 
 This is not an authentication or cryptographic actor-identity design. The
 workflow decides whether the available context relationship satisfies its
@@ -155,17 +147,19 @@ The expected governance rules are:
    to distinct execution contexts where the workflow requires separation.
 2. A same-role revision resumes the appropriate producer context rather than
    silently switching contexts.
-3. An unavailable-context replacement or authorized fork receives a distinct
-   execution identity and records explicit lineage to the original.
+3. An unavailable-context replacement is a Fidenaut-authorized fresh context
+   with a distinct identity and explicit Fidenaut-owned lineage to the
+   original; an executor fork is not required.
 4. Fidenaut rejects collisions or missing relationship evidence and does not
    advance on an unverifiable binding.
 
-A self-reported context ID does not automatically prove independence. Whether
-fresh executor contexts have isolated prompts, histories, filesystems, and
-permissions is an executor trust-boundary question that requires prototype
-validation. The current implementation also treats its runtime evidence as
-execution evidence rather than authentication; delegation changes who attests
-the context facts, not the governance rule Fidenaut applies to them.
+A context ID or role label does not prove independence. Contexts must meet the
+deployment-specific isolation qualification evidence defined by the
+normative contract, including identification of executor versus host
+guarantees and conformance checks for relevant shared state. The current
+implementation also treats its runtime evidence as execution evidence rather
+than authentication; delegation changes who attests context facts, not the
+governance rule Fidenaut applies to them.
 
 ## Current implementation versus proposed target
 
@@ -196,36 +190,46 @@ fail-closed checks remain even if an executor supplies stronger journals.
 | Architecture | Fidenaut owns | Main trade-off |
 | --- | --- | --- |
 | Fidenaut-owned execution | Governance and all agent process/runtime machinery | Maximum local control, but provider/runtime failures and lifecycle complexity remain in Fidenaut |
-| Governance plus external agent runtime | Governance, evidence, approvals, and an executor adapter | Smallest proposed boundary; depends on executor context and outcome semantics |
+| Governance plus external agent runtime | Governance, evidence, approvals, and an executor adapter | Potentially smaller runtime burden; depends on executor context and outcome semantics |
 | Governance plus durable workflow engine plus agent runtime | Governance, a durable orchestration substrate, and an agent executor | May improve operation durability, but adds another platform and risks moving governance into substrate semantics |
 
-The current direction is the middle option, with a thin adapter contract and
-the executor treated as untrusted. A durable workflow engine is not part of
-the initial decision; it becomes relevant only if prototype evidence shows
-that an agent runtime cannot supply adequate operation durability.
+The middle option remains under evaluation; it is not a selected direction.
+A future adapter design can proceed only after the proposed contract's
+unresolved policy decisions are resolved and an executor is shown to meet its
+requirements. A durable workflow engine is not selected or excluded; its
+relevance depends on whether an eventual execution layer can meet the
+operation-recovery contract without moving governance authority out of
+Fidenaut.
 
 No technology is selected. Candidates from Issue #72 — including OpenHands,
 Goose, Codex, Copilot, ACP, A2A, Temporal, DBOS, Restate, OPA, and OpenFGA —
 remain candidates for deeper evaluation only. Policy engines are governance
 primitives, not execution replacements.
 
-## Unresolved questions for a prototype
+## Unresolved design decisions and research
 
-- Can a selected executor demonstrate genuinely isolated fresh contexts for
-  planner and reviewer, including history, prompt, filesystem, and permissions?
-- Can it resume the original producer context and represent a replacement as a
-  distinct, traceable identity?
-- Can Fidenaut retrieve artifacts and repository changes without sharing its
-  worktree or trusting executor-authored descriptions?
-- Is outcome retrieval idempotent after a lost response, including a completed
-  nonzero provider failure?
-- Can the executor expose failure classes and bounded retry behavior without
-  requiring Fidenaut to understand provider-specific mechanisms?
-- Which executor facts can be independently checked, and which must remain
-  explicit trust assumptions?
-- Can one provider-neutral adapter support more than one execution technology?
-- What migration or supersession rule is needed for existing runs whose
-  context bindings refer to the current managed runtime?
+The contract deliberately leaves these governance/design questions open;
+neither this document nor a prototype should assign arbitrary defaults:
+
+- **Isolation qualification:** what deployment-specific evidence and
+  conformance results are sufficient to qualify executor/host guarantees for
+  role contexts?
+- **Persistently unknown operation:** what explicit human/governed disposition,
+  if any, can unblock work when the same operation remains `UNKNOWN`, and what
+  evidence is required without claiming it failed or was canceled?
+- **Terminal-failure retry policy:** which known terminal failures, if any,
+  can authorize a distinct new operation at each role gate, subject to
+  approval and revision limits?
+- **Artifact base and retrieval:** what repository identity/base evidence and
+  retrieval binding are required for repository changes and non-Git outputs?
+
+Research must also establish whether a candidate can meet the contract's
+context continuity, outcome recovery, failure/side-effect certainty, and
+artifact requirements. The #72 OpenHands and Goose experiments are evidence
+for the requirements, not a permanent selection or rejection of either
+project. Provider-neutrality and any migration/supersession rule for existing
+managed-runtime context bindings remain evaluation questions, not contract
+semantics.
 
 Until these questions are answered, the current managed runtime remains the
 active implementation and the governance/execution split remains a proposed
