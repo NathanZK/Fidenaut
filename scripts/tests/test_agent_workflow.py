@@ -312,6 +312,10 @@ class AgentWorkflowTest(unittest.TestCase):
                 )
                 self.assertEqual(0, code, authorized)
                 self.assertIsNone(authorized["revision_authorization"]["consecutive_count"])
+                self.assertEqual(
+                    self.state()["_state_revision"],
+                    authorized["revision_authorization"]["state_revision"],
+                )
                 self.assertEqual(0, self.state()["revision_counts"][gate])
                 self.assertEqual(
                     {name: None for name in workflow.REVIEW_GATES if name != gate},
@@ -3407,6 +3411,8 @@ class AgentWorkflowTest(unittest.TestCase):
         target_head = self.git("rev-parse", "origin/main").stdout.strip()
         self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
         initialized = self.state()
+        self.assertRegex(initialized["run_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual("managed-v0", initialized["role_execution_mode"])
         self.assertEqual(target_head, initialized["target_head"])
         self.assertEqual(target_head, initialized["base_head"])
         self.assertEqual(target_head, initialized["initial_head"])
@@ -3415,6 +3421,1113 @@ class AgentWorkflowTest(unittest.TestCase):
         code, payload, _ = self.run_cli("init", str(ISSUE + 1))
         self.assertEqual(1, code)
         self.assertEqual("workflow-start-not-at-target", payload["error"]["code"])
+
+    def test_init_pins_executor_mode_from_configuration(self):
+        path = self.root / ".github" / "agent-workflow.json"
+        config = json.loads(path.read_text(encoding="utf-8"))
+        config["workflow"]["role_execution"] = "executor-v1"
+        path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+
+        state = self.state()
+        self.assertRegex(state["run_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual("executor-v1", state["role_execution_mode"])
+
+    def test_invalid_or_conflicting_role_execution_configuration_fails_closed(self):
+        path = self.root / ".github" / "agent-workflow.json"
+        original = json.loads(path.read_text(encoding="utf-8"))
+        cases = (
+            ("unknown", False),
+            ("executor-v1", True),
+            (None, "true"),
+        )
+        for mode, legacy in cases:
+            with self.subTest(mode=mode, legacy=legacy):
+                config = json.loads(json.dumps(original))
+                if mode is not None:
+                    config["workflow"]["role_execution"] = mode
+                config["workflow"]["role_execution_contexts"] = legacy
+                path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+                with self.assertRaises(workflow.WorkflowError) as raised:
+                    workflow._load_config(self.root)
+
+                self.assertEqual("invalid-config", raised.exception.code)
+
+        config = json.loads(json.dumps(original))
+        config["workflow"]["role_execution"] = None
+        path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            workflow._load_config(self.root)
+        self.assertEqual("invalid-config", raised.exception.code)
+
+    def test_unambiguous_legacy_context_is_managed_v0(self):
+        config = workflow._load_config(self.root)
+        state = {
+            "role_contexts": {
+                "planner": {"instance_id": "legacy-planner"}
+            }
+        }
+
+        self.assertEqual("managed-v0", workflow._state_role_execution_mode(config, state))
+
+    def test_run_role_rejects_config_mode_change_before_runtime(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        path = self.root / ".github" / "agent-workflow.json"
+        config = json.loads(path.read_text(encoding="utf-8"))
+        config["workflow"]["role_execution"] = "executor-v1"
+        path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+        with mock.patch.object(
+            workflow.workflow_supervisor, "ManagedExecutionRuntime",
+            side_effect=workflow.WorkflowError("runtime-invoked", "runtime was invoked"),
+        ) as runtime:
+            code, payload, _ = self.run_cli(
+                "run-role", str(ISSUE), "--agent", "chess-echo-planner",
+                "--command", '["true"]', "--output", "artifacts-src/plan.md",
+            )
+
+        self.assertEqual(1, code)
+        self.assertEqual("role-execution-mode-mismatch", payload["error"]["code"])
+        runtime.assert_not_called()
+
+    def test_run_role_rejects_executor_mode_before_runtime(self):
+        path = self.root / ".github" / "agent-workflow.json"
+        config = json.loads(path.read_text(encoding="utf-8"))
+        config["workflow"]["role_execution"] = "executor-v1"
+        path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+
+        with mock.patch.object(
+            workflow.workflow_supervisor, "ManagedExecutionRuntime"
+        ) as runtime:
+            code, payload, _ = self.run_cli(
+                "run-role", str(ISSUE), "--agent", "chess-echo-planner",
+                "--command", '["true"]', "--output", "artifacts-src/plan.md",
+            )
+
+        self.assertEqual(1, code)
+        self.assertEqual("role-execution-mode-unsupported", payload["error"]["code"])
+        runtime.assert_not_called()
+
+    def test_ambiguous_legacy_mode_fails_before_runtime(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        state = self.state()
+        state.pop("role_execution_mode", None)
+        state.pop("run_id", None)
+        state["role_contexts"] = {}
+        self.write_state(state)
+
+        with mock.patch.object(
+            workflow.workflow_supervisor, "ManagedExecutionRuntime",
+            side_effect=workflow.WorkflowError("runtime-invoked", "runtime was invoked"),
+        ) as runtime:
+            code, payload, _ = self.run_cli(
+                "run-role", str(ISSUE), "--agent", "chess-echo-planner",
+                "--command", '["true"]', "--output", "artifacts-src/plan.md",
+            )
+
+        self.assertEqual(1, code)
+        self.assertEqual("ambiguous-role-execution-mode", payload["error"]["code"])
+        runtime.assert_not_called()
+
+    def role_operation_identity(self, state, role="planner", purpose="plan"):
+        binding = {"context_id": "context-" + role, "generation": 1}
+        return {
+            "issue": state["issue"],
+            "run_id": state["run_id"],
+            "mode": state["role_execution_mode"],
+            "gate": state["status"],
+            "revision": state["_state_revision"],
+            "role": role,
+            "binding": binding,
+            "purpose": purpose,
+            "inputs": [],
+            "request": {"instructions": "create the canonical plan"},
+        }
+
+    def admit_role_operation(self, issue, identity):
+        config = workflow._load_config(self.root)
+        return workflow._admit_role_operation(
+            self.root, config, issue, identity
+        )
+
+    def verified_role_operation_transition(
+        self, record, to_status, result=None, failure_reason=None
+    ):
+        return workflow._GovernanceVerifiedRoleOperationTransition(
+            run_id=record["run_id"],
+            op_id=record["op_id"],
+            request_fp=record["request_fp"],
+            expected_state_revision=record["state_revision"],
+            from_status=record["status"],
+            to_status=to_status,
+            result=result,
+            failure_reason=failure_reason,
+        )
+
+    def apply_role_operation_transition(self, issue, transition):
+        config = workflow._load_config(self.root)
+        return workflow._apply_verified_role_operation_transition(
+            self.root, config, issue, transition
+        )
+
+    def state_for_issue(self, issue):
+        path = (
+            self.root
+            / ".agent-workflow"
+            / "runs"
+            / ("issue-%s" % issue)
+            / "state.json"
+        )
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_role_operation_admission_reserves_and_replays_exact_identity(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        identity = self.role_operation_identity(self.state())
+        identity["purpose"] = "plán"
+        identity["request"] = {
+            "instructions": "create the canonical plan",
+            "options": {"tools": ["read"], "timeout": 5},
+        }
+
+        admitted = self.admit_role_operation(ISSUE, identity)
+        state_after_admission = self.state()
+        reordered_identity = json.loads(json.dumps(identity))
+        reordered_identity["request"] = {
+            "options": {"timeout": 5, "tools": ["read"]},
+            "instructions": "create the canonical plan",
+        }
+        replayed = self.admit_role_operation(ISSUE, reordered_identity)
+
+        self.assertEqual("fidenaut-role-op-v1", admitted["format"])
+        self.assertEqual(identity, admitted["request_identity"])
+        self.assertEqual(1, admitted["delivery_attempt"])
+        self.assertEqual("reserved", admitted["status"])
+        self.assertEqual(
+            state_after_admission["role_ops"][admitted["op_id"]],
+            replayed,
+        )
+        self.assertEqual(state_after_admission, self.state())
+
+    def test_role_operation_record_rejects_changed_request_under_existing_id(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        identity = self.role_operation_identity(self.state())
+        admitted = self.admit_role_operation(ISSUE, identity)
+        state = self.state()
+        state["role_ops"][admitted["op_id"]]["request_identity"]["request"][
+            "instructions"
+        ] = "changed meaning"
+        self.write_state(state)
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.admit_role_operation(ISSUE, identity)
+
+        self.assertEqual("invalid-role-operation-record", raised.exception.code)
+
+    def test_duplicate_role_operation_identity_under_new_id_fails_closed(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        identity = self.role_operation_identity(self.state())
+        admitted = self.admit_role_operation(ISSUE, identity)
+        state = self.state()
+        duplicate = json.loads(json.dumps(admitted))
+        duplicate_id = "e" * 32
+        duplicate["op_id"] = duplicate_id
+        duplicate["status"] = "failed"
+        duplicate["failure_reason"] = "unauthorized duplicate"
+        state["role_ops"][duplicate_id] = duplicate
+        self.write_state(state)
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.admit_role_operation(ISSUE, identity)
+
+        self.assertEqual("invalid-role-operation-record", raised.exception.code)
+
+    def test_role_operation_admission_rejects_stale_revision(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        identity = self.role_operation_identity(self.state())
+        state = self.state()
+        state["validation"] = {"passed": False}
+        workflow._write_state(
+            self.root, workflow._load_config(self.root), ISSUE, state
+        )
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.admit_role_operation(ISSUE, identity)
+
+        self.assertEqual("stale-role-operation-revision", raised.exception.code)
+        self.assertNotIn("role_ops", self.state())
+
+    def test_role_operation_admission_enforces_one_open_record(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        first_identity = self.role_operation_identity(self.state())
+        first = self.admit_role_operation(ISSUE, first_identity)
+        second_state = self.state()
+        second_identity = self.role_operation_identity(
+            second_state, purpose="another operation"
+        )
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.admit_role_operation(ISSUE, second_identity)
+
+        self.assertEqual("role-operation-pending", raised.exception.code)
+        self.assertEqual(
+            {first["op_id"]},
+            set(self.state()["role_ops"]),
+        )
+
+    def test_role_operation_state_rejects_multiple_open_records(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        admitted = self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        state = self.state()
+        duplicate = json.loads(json.dumps(admitted))
+        duplicate_id = "d" * 32
+        duplicate["op_id"] = duplicate_id
+        duplicate["request_identity"]["purpose"] = "another open operation"
+        _, duplicate["request_fp"] = workflow._canonical_role_operation_identity(
+            duplicate["request_identity"]
+        )
+        state["role_ops"][duplicate_id] = duplicate
+        self.write_state(state)
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            workflow._read_state(
+                self.root, workflow._load_config(self.root), ISSUE
+            )
+
+        self.assertEqual("invalid-role-operation-record", raised.exception.code)
+
+    def test_role_operation_state_rejects_record_mode_mismatch(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        config_path = self.root / ".github" / "agent-workflow.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["workflow"]["role_execution"] = "executor-v1"
+        config_path.write_text(
+            json.dumps(config, indent=2) + "\n", encoding="utf-8"
+        )
+        state = self.state()
+        state["role_execution_mode"] = "executor-v1"
+        self.write_state(state)
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            workflow._read_state(
+                self.root, workflow._load_config(self.root), ISSUE
+            )
+
+        self.assertEqual("invalid-role-operation-record", raised.exception.code)
+
+    def test_concurrent_role_operation_admissions_preserve_g9(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        identities = [
+            self.role_operation_identity(
+                self.state(), purpose="concurrent operation %d" % index
+            )
+            for index in range(2)
+        ]
+        barrier = threading.Barrier(2)
+        results = []
+
+        def admit(identity):
+            barrier.wait()
+            try:
+                results.append(self.admit_role_operation(ISSUE, identity))
+            except workflow.WorkflowError as error:
+                results.append(error)
+
+        threads = [
+            threading.Thread(target=admit, args=(identity,))
+            for identity in identities
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(1, sum(isinstance(result, dict) for result in results))
+        self.assertEqual(1, sum(isinstance(result, workflow.WorkflowError) for result in results))
+        open_records = [
+            record for record in self.state()["role_ops"].values()
+            if record["status"] in ("reserved", "dispatched", "unknown")
+        ]
+        self.assertEqual(1, len(open_records))
+
+    def test_role_operation_request_identity_rejects_non_json_values(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        identity = self.role_operation_identity(self.state())
+        identity["request"]["invalid"] = float("nan")
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.admit_role_operation(ISSUE, identity)
+
+        self.assertEqual("invalid-role-operation-identity", raised.exception.code)
+        self.assertNotIn("role_ops", self.state())
+
+    def test_role_operation_state_rejects_duplicate_json_keys(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        path = (
+            self.root
+            / ".agent-workflow"
+            / "runs"
+            / ("issue-%s" % ISSUE)
+            / "state.json"
+        )
+        content = path.read_text(encoding="utf-8")
+        self.assertIn('"status": "PLANNING",', content)
+        path.write_text(
+            content.replace(
+                '"status": "PLANNING",',
+                '"status": "PLANNING", "status": "PLAN_REVIEW",',
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            workflow._read_state(self.root, workflow._load_config(self.root), ISSUE)
+
+        self.assertEqual("invalid-json", raised.exception.code)
+
+    def test_role_operation_ids_are_unique_across_runs_and_generations(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        first_identity = self.role_operation_identity(self.state())
+        self.assertEqual(0, self.run_cli("init", str(ISSUE + 1))[0])
+        second_identity = self.role_operation_identity(self.state_for_issue(ISSUE + 1))
+        second_identity["binding"]["generation"] = 2
+        generated_id = SimpleNamespace(hex="f" * 32)
+
+        with mock.patch.object(
+            workflow.uuid, "uuid4", side_effect=[generated_id, generated_id]
+        ):
+            first = self.admit_role_operation(ISSUE, first_identity)
+            with self.assertRaises(workflow.WorkflowError) as raised:
+                self.admit_role_operation(ISSUE + 1, second_identity)
+
+        self.assertEqual("duplicate-role-operation-id", raised.exception.code)
+        self.assertEqual("f" * 32, first["op_id"])
+        self.assertNotIn("role_ops", self.state_for_issue(ISSUE + 1))
+
+    def test_role_operation_transition_rejects_raw_executor_observation(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        identity = self.role_operation_identity(self.state())
+        admitted = self.admit_role_operation(ISSUE, identity)
+        observation = {
+            "op_id": admitted["op_id"],
+            "status": "SUCCESS",
+            "result": {"claim": "accepted"},
+        }
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.apply_role_operation_transition(ISSUE, observation)
+
+        self.assertEqual(
+            "unverified-role-operation-transition", raised.exception.code
+        )
+        self.assertEqual("reserved", self.state()["role_ops"][admitted["op_id"]]["status"])
+
+    def test_role_operation_state_machine_accepts_verified_transitions(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        identity = self.role_operation_identity(self.state())
+        admitted = self.admit_role_operation(ISSUE, identity)
+        invalid = self.verified_role_operation_transition(
+            admitted, "succeeded", result={"verified": True}
+        )
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.apply_role_operation_transition(ISSUE, invalid)
+
+        self.assertEqual("invalid-role-operation-transition", raised.exception.code)
+        self.assertEqual("reserved", self.state()["role_ops"][admitted["op_id"]]["status"])
+        dispatched = self.apply_role_operation_transition(
+            ISSUE, self.verified_role_operation_transition(admitted, "dispatched")
+        )
+        accepted = self.apply_role_operation_transition(
+            ISSUE,
+            self.verified_role_operation_transition(
+                dispatched, "succeeded", result={"verified": True}
+            ),
+        )
+
+        self.assertEqual("succeeded", accepted["status"])
+        self.assertEqual({"verified": True}, accepted["result"])
+        self.assertEqual(
+            accepted["state_revision"], self.state()["_state_revision"]
+        )
+
+    def test_role_operation_state_machine_covers_all_open_transitions(self):
+        cases = (
+            ("reserved", "dispatched"),
+            ("reserved", "unknown"),
+            ("dispatched", "unknown"),
+            ("dispatched", "succeeded"),
+            ("dispatched", "failed"),
+            ("unknown", "unknown"),
+            ("unknown", "dispatched"),
+            ("unknown", "succeeded"),
+            ("unknown", "failed"),
+        )
+        for offset, (from_status, to_status) in enumerate(cases, start=10):
+            with self.subTest(from_status=from_status, to_status=to_status):
+                issue = ISSUE + offset
+                self.assertEqual(0, self.run_cli("init", str(issue))[0])
+                state = self.state_for_issue(issue)
+                record = self.admit_role_operation(
+                    issue, self.role_operation_identity(state)
+                )
+                if from_status in ("dispatched", "unknown"):
+                    record = self.apply_role_operation_transition(
+                        issue,
+                        self.verified_role_operation_transition(record, from_status),
+                    )
+                transition = self.verified_role_operation_transition(
+                    record,
+                    to_status,
+                    result={"verified": True} if to_status == "succeeded" else None,
+                    failure_reason=(
+                        "verified failure" if to_status == "failed" else None
+                    ),
+                )
+
+                updated = self.apply_role_operation_transition(issue, transition)
+
+                self.assertEqual(to_status, updated["status"])
+                self.assertEqual(
+                    updated["state_revision"],
+                    self.state_for_issue(issue)["_state_revision"],
+                )
+
+    def test_stale_p4_acceptance_fails_without_mutating_operation(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        admitted = self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        dispatched = self.apply_role_operation_transition(
+            ISSUE, self.verified_role_operation_transition(admitted, "dispatched")
+        )
+        stale_acceptance = self.verified_role_operation_transition(
+            dispatched, "succeeded", result={"verified": True}
+        )
+        state = self.state()
+        state["validation"] = {"passed": False}
+        workflow._write_state(
+            self.root, workflow._load_config(self.root), ISSUE, state
+        )
+        before_acceptance = self.state()
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.apply_role_operation_transition(ISSUE, stale_acceptance)
+
+        self.assertEqual("stale-role-operation-revision", raised.exception.code)
+        self.assertEqual(before_acceptance, self.state())
+        self.assertEqual(
+            "dispatched",
+            self.state()["role_ops"][admitted["op_id"]]["status"],
+        )
+
+    def test_unknown_operation_blocks_new_admission_after_state_reload(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        admitted = self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        unknown = self.apply_role_operation_transition(
+            ISSUE, self.verified_role_operation_transition(admitted, "unknown")
+        )
+        reloaded_state = workflow._read_state(
+            self.root, workflow._load_config(self.root), ISSUE
+        )
+        new_identity = self.role_operation_identity(
+            reloaded_state, purpose="replacement operation"
+        )
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.admit_role_operation(ISSUE, new_identity)
+
+        self.assertEqual("role-operation-pending", raised.exception.code)
+        self.assertEqual("unknown", self.state()["role_ops"][unknown["op_id"]]["status"])
+        dispatched = self.apply_role_operation_transition(
+            ISSUE, self.verified_role_operation_transition(unknown, "dispatched")
+        )
+        failed = self.apply_role_operation_transition(
+            ISSUE,
+            self.verified_role_operation_transition(
+                dispatched, "failed", failure_reason="verified terminal failure"
+            ),
+        )
+        self.assertEqual("failed", failed["status"])
+
+    def test_new_operation_after_terminal_requires_governed_revision_link(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        first_identity = self.role_operation_identity(self.state())
+        first = self.admit_role_operation(ISSUE, first_identity)
+        dispatched = self.apply_role_operation_transition(
+            ISSUE, self.verified_role_operation_transition(first, "dispatched")
+        )
+        failed = self.apply_role_operation_transition(
+            ISSUE,
+            self.verified_role_operation_transition(
+                dispatched, "failed", failure_reason="verified failure"
+            ),
+        )
+        state = self.state()
+        revision_request = {
+            "requested_by": "reviewer",
+            "requested_at": "2026-10-01T10:00:00+00:00",
+            "reason_code": "approved-plan-defect",
+            "reason": "revise the approved plan",
+            "from_status": "TEST_IMPLEMENTATION",
+            "state_revision": state["_state_revision"] + 1,
+        }
+        state["plan_revision_requests"] = [revision_request]
+        workflow._write_state(
+            self.root, workflow._load_config(self.root), ISSUE, state
+        )
+        next_identity = self.role_operation_identity(
+            self.state(), purpose=first_identity["purpose"]
+        )
+        next_identity["request"] = json.loads(json.dumps(first_identity["request"]))
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.admit_role_operation(ISSUE, next_identity)
+
+        self.assertEqual(
+            "role-operation-prior-authorization-required", raised.exception.code
+        )
+        next_identity["prior_op"] = failed["op_id"]
+        next_identity["authorization"] = {
+            "kind": "plan_revision_request",
+            "index": 1,
+            "record": revision_request,
+            "prior_op": failed["op_id"],
+            "gate": next_identity["gate"],
+            "revision": next_identity["revision"],
+        }
+        authorized = self.admit_role_operation(ISSUE, next_identity)
+
+        self.assertEqual(failed["op_id"], authorized["prior_op"])
+        self.assertEqual("reserved", authorized["status"])
+
+    def test_failed_role_operation_cannot_be_bypassed_by_changing_purpose(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        first_identity = self.role_operation_identity(self.state())
+        first = self.admit_role_operation(ISSUE, first_identity)
+        dispatched = self.apply_role_operation_transition(
+            ISSUE, self.verified_role_operation_transition(first, "dispatched")
+        )
+        failed = self.apply_role_operation_transition(
+            ISSUE,
+            self.verified_role_operation_transition(
+                dispatched, "failed", failure_reason="verified failure"
+            ),
+        )
+        changed_purpose = self.role_operation_identity(
+            self.state(), purpose="unrelated purpose"
+        )
+        changed_purpose["request"] = json.loads(
+            json.dumps(first_identity["request"])
+        )
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.admit_role_operation(ISSUE, changed_purpose)
+
+        self.assertEqual(
+            "role-operation-prior-authorization-required", raised.exception.code
+        )
+        state = self.state()
+        revision_request = {
+            "requested_by": "reviewer",
+            "requested_at": "2026-10-01T10:00:00+00:00",
+            "reason_code": "approved-plan-defect",
+            "reason": "authorize replacement work",
+            "from_status": "TEST_IMPLEMENTATION",
+            "state_revision": state["_state_revision"] + 1,
+        }
+        state["plan_revision_requests"] = [revision_request]
+        workflow._write_state(
+            self.root, workflow._load_config(self.root), ISSUE, state
+        )
+        changed_purpose = self.role_operation_identity(
+            self.state(), purpose="unrelated purpose"
+        )
+        changed_purpose["request"] = json.loads(
+            json.dumps(first_identity["request"])
+        )
+        changed_purpose["prior_op"] = failed["op_id"]
+        changed_purpose["authorization"] = {
+            "kind": "plan_revision_request",
+            "index": 1,
+            "record": revision_request,
+            "prior_op": failed["op_id"],
+            "gate": changed_purpose["gate"],
+            "revision": changed_purpose["revision"],
+        }
+
+        authorized = self.admit_role_operation(ISSUE, changed_purpose)
+
+        self.assertEqual(failed["op_id"], authorized["prior_op"])
+        self.assertEqual("unrelated purpose", authorized["request_identity"]["purpose"])
+
+    def test_role_operation_authorization_must_match_gate_and_revision(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        first = self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        dispatched = self.apply_role_operation_transition(
+            ISSUE, self.verified_role_operation_transition(first, "dispatched")
+        )
+        failed = self.apply_role_operation_transition(
+            ISSUE,
+            self.verified_role_operation_transition(
+                dispatched, "failed", failure_reason="verified failure"
+            ),
+        )
+        state = self.state()
+        authorization = {
+            "kind": workflow.LOCAL_ACKNOWLEDGMENT_KIND,
+            "gate": "implementation",
+            "asserted_by": "reviewer",
+            "confirmation": workflow.REVISION_CONFIRMATION,
+            "recorded_at": "2026-10-01T10:00:00+00:00",
+        }
+        state["revision_authorizations"] = [authorization]
+        workflow._write_state(
+            self.root, workflow._load_config(self.root), ISSUE, state
+        )
+        next_identity = self.role_operation_identity(self.state())
+        next_identity["prior_op"] = failed["op_id"]
+        next_identity["authorization"] = {
+            "kind": "revision_authorization",
+            "index": 1,
+            "record": authorization,
+            "prior_op": failed["op_id"],
+            "gate": next_identity["gate"],
+            "revision": next_identity["revision"],
+        }
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.admit_role_operation(ISSUE, next_identity)
+
+        self.assertEqual(
+            "role-operation-prior-authorization-invalid", raised.exception.code
+        )
+
+    def test_role_operation_authorization_must_bind_prior_and_exact_revision(self):
+        for offset, binding_change in enumerate(
+            ("prior_op", "gate", "revision", "event_revision"), start=1
+        ):
+            with self.subTest(binding_change=binding_change):
+                issue = ISSUE + 100 + offset
+                self.assertEqual(0, self.run_cli("init", str(issue))[0])
+                first = self.admit_role_operation(
+                    issue, self.role_operation_identity(self.state_for_issue(issue))
+                )
+                dispatched = self.apply_role_operation_transition(
+                    issue, self.verified_role_operation_transition(first, "dispatched")
+                )
+                failed = self.apply_role_operation_transition(
+                    issue,
+                    self.verified_role_operation_transition(
+                        dispatched, "failed", failure_reason="verified failure"
+                    ),
+                )
+                state = self.state_for_issue(issue)
+                revision_request = {
+                    "requested_by": "reviewer",
+                    "requested_at": "2026-10-01T10:00:00+00:00",
+                    "reason_code": "approved-plan-defect",
+                    "reason": "revise the approved plan",
+                    "from_status": "TEST_IMPLEMENTATION",
+                    "state_revision": state["_state_revision"] + 1,
+                }
+                if binding_change == "event_revision":
+                    revision_request["state_revision"] -= 1
+                state["plan_revision_requests"] = [revision_request]
+                workflow._write_state(
+                    self.root, workflow._load_config(self.root), issue, state
+                )
+                identity = self.role_operation_identity(
+                    self.state_for_issue(issue)
+                )
+                identity["prior_op"] = failed["op_id"]
+                identity["authorization"] = {
+                    "kind": "plan_revision_request",
+                    "index": 1,
+                    "record": revision_request,
+                    "prior_op": failed["op_id"],
+                    "gate": identity["gate"],
+                    "revision": identity["revision"],
+                }
+                if binding_change == "prior_op":
+                    identity["authorization"]["prior_op"] = "f" * 32
+                elif binding_change == "gate":
+                    identity["authorization"]["gate"] = "TEST_IMPLEMENTATION"
+                elif binding_change == "revision":
+                    identity["authorization"]["revision"] -= 1
+
+                with self.assertRaises(workflow.WorkflowError) as raised:
+                    self.admit_role_operation(issue, identity)
+
+                self.assertEqual(
+                    "role-operation-prior-authorization-invalid",
+                    raised.exception.code,
+                )
+
+    def test_role_operation_authorization_cannot_be_reused(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        first = self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        dispatched = self.apply_role_operation_transition(
+            ISSUE, self.verified_role_operation_transition(first, "dispatched")
+        )
+        failed = self.apply_role_operation_transition(
+            ISSUE,
+            self.verified_role_operation_transition(
+                dispatched, "failed", failure_reason="verified failure"
+            ),
+        )
+        state = self.state()
+        revision_request = {
+            "requested_by": "reviewer",
+            "requested_at": "2026-10-01T10:00:00+00:00",
+            "reason_code": "approved-plan-defect",
+            "reason": "revise the approved plan",
+            "from_status": "TEST_IMPLEMENTATION",
+            "state_revision": state["_state_revision"] + 1,
+        }
+        state["plan_revision_requests"] = [revision_request]
+        workflow._write_state(
+            self.root, workflow._load_config(self.root), ISSUE, state
+        )
+        first_retry_identity = self.role_operation_identity(self.state())
+        first_retry_identity["prior_op"] = failed["op_id"]
+        first_retry_identity["authorization"] = {
+            "kind": "plan_revision_request",
+            "index": 1,
+            "record": revision_request,
+            "prior_op": failed["op_id"],
+            "gate": first_retry_identity["gate"],
+            "revision": first_retry_identity["revision"],
+        }
+        retry = self.admit_role_operation(ISSUE, first_retry_identity)
+        dispatched_retry = self.apply_role_operation_transition(
+            ISSUE,
+            self.verified_role_operation_transition(retry, "dispatched"),
+        )
+        succeeded_retry = self.apply_role_operation_transition(
+            ISSUE,
+            self.verified_role_operation_transition(
+                dispatched_retry, "succeeded", result={"verified": True}
+            ),
+        )
+        state = self.state()
+        reused_identity = json.loads(
+            json.dumps(first_retry_identity)
+        )
+        reused_identity["prior_op"] = succeeded_retry["op_id"]
+        reused_identity["request"]["instructions"] = "reused authorization"
+        reused_identity["authorization"]["prior_op"] = succeeded_retry["op_id"]
+        reused_identity["authorization"]["revision"] = reused_identity["revision"]
+        _, request_fp = workflow._canonical_role_operation_identity(reused_identity)
+        duplicate_id = "a" * 32
+        next_state_revision = state["_state_revision"] + 1
+        state["role_ops"][duplicate_id] = {
+            "format": workflow.ROLE_OPERATION_FORMAT,
+            "op_id": duplicate_id,
+            "run_id": state["run_id"],
+            "mode": state["role_execution_mode"],
+            "gate": reused_identity["gate"],
+            "role": reused_identity["role"],
+            "request_identity": reused_identity,
+            "request_fp": request_fp,
+            "state_revision": next_state_revision,
+            "delivery_attempt": 1,
+            "status": "reserved",
+            "prior_op": succeeded_retry["op_id"],
+            "result": None,
+            "failure_reason": None,
+        }
+        workflow._write_state(
+            self.root, workflow._load_config(self.root), ISSUE, state
+        )
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            workflow._read_state(
+                self.root, workflow._load_config(self.root), ISSUE
+            )
+
+        self.assertEqual(
+            "invalid-role-operation-record", raised.exception.code
+        )
+
+    def test_malformed_role_operation_fails_before_managed_runtime(self):
+        self.enable_role_execution()
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        admitted = self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        state = self.state()
+        state["role_ops"][admitted["op_id"]]["status"] = "SUCCESS"
+        self.write_state(state)
+
+        with mock.patch.object(
+            workflow.workflow_supervisor, "ManagedExecutionRuntime",
+            side_effect=workflow.WorkflowError("runtime-invoked", "runtime was invoked"),
+        ) as runtime:
+            code, payload, _ = self.run_cli(
+                "run-role", str(ISSUE), "--agent", "chess-echo-planner",
+                "--command", '["true"]', "--output", "artifacts-src/plan.md",
+            )
+
+        self.assertEqual(1, code)
+        self.assertEqual("invalid-role-operation-record", payload["error"]["code"])
+        runtime.assert_not_called()
+
+    def test_terminal_operation_replay_is_idempotent_and_immutable(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        admitted = self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        dispatched = self.apply_role_operation_transition(
+            ISSUE, self.verified_role_operation_transition(admitted, "dispatched")
+        )
+        success = self.verified_role_operation_transition(
+            dispatched, "succeeded", result={"verified": True}
+        )
+        accepted = self.apply_role_operation_transition(ISSUE, success)
+        replayed = self.apply_role_operation_transition(ISSUE, success)
+        conflicting = self.verified_role_operation_transition(
+            accepted, "failed", failure_reason="changed terminal result"
+        )
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.apply_role_operation_transition(ISSUE, conflicting)
+
+        self.assertEqual("terminal-role-operation-immutable", raised.exception.code)
+        self.assertEqual(accepted, replayed)
+        self.assertEqual(accepted, self.state()["role_ops"][accepted["op_id"]])
+
+    def test_atomic_admission_survives_pre_and_post_replace_failures(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        identity = self.role_operation_identity(self.state())
+        state_path = (
+            self.root
+            / ".agent-workflow"
+            / "runs"
+            / ("issue-%s" % ISSUE)
+            / "state.json"
+        )
+        before = state_path.read_bytes()
+
+        with mock.patch.object(
+            workflow.os, "replace", side_effect=OSError("injected before replace")
+        ):
+            with self.assertRaises(workflow.WorkflowError) as raised:
+                self.admit_role_operation(ISSUE, identity)
+
+        self.assertEqual("persistence-failed", raised.exception.code)
+        self.assertEqual(before, state_path.read_bytes())
+        self.assertEqual([], list(state_path.parent.glob(".state.json.*.tmp")))
+
+        original_write_json = workflow._write_json
+
+        def persist_then_lose_ack(path, payload):
+            original_write_json(path, payload)
+            if path.name == "state.json":
+                raise RuntimeError("injected after atomic replace")
+
+        with mock.patch.object(workflow, "_write_json", side_effect=persist_then_lose_ack):
+            with self.assertRaises(RuntimeError):
+                self.admit_role_operation(ISSUE, identity)
+
+        persisted = self.state()
+        self.assertEqual(1, len(persisted["role_ops"]))
+        replayed = self.admit_role_operation(ISSUE, identity)
+        self.assertEqual(
+            persisted["role_ops"][replayed["op_id"]], replayed
+        )
+
+    def test_compare_and_swap_rejects_stale_state_snapshot(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        stale_state = self.state()
+        newer_state = self.state()
+        newer_state["validation"] = {"passed": True}
+        workflow._write_state(
+            self.root, workflow._load_config(self.root), ISSUE, newer_state
+        )
+        persisted = self.state()
+        stale_state["validation"] = {"passed": False}
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            workflow._write_state(
+                self.root, workflow._load_config(self.root), ISSUE, stale_state
+            )
+
+        self.assertEqual("concurrent-state-update", raised.exception.code)
+        self.assertEqual(persisted, self.state())
+
+    def test_two_stale_state_writers_racing_allow_only_one_commit(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        config = workflow._load_config(self.root)
+        snapshots = [
+            workflow._read_state(self.root, config, ISSUE)
+            for _ in range(2)
+        ]
+        initial_revision = snapshots[0]["_state_revision"]
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def write_snapshot(index):
+            snapshots[index]["validation"] = {"writer": index}
+            barrier.wait()
+            try:
+                workflow._write_state(
+                    self.root, config, ISSUE, snapshots[index]
+                )
+                outcomes.append((index, None))
+            except workflow.WorkflowError as error:
+                outcomes.append((index, error.code))
+
+        threads = [
+            threading.Thread(target=write_snapshot, args=(index,))
+            for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(1, sum(error is None for _, error in outcomes))
+        self.assertEqual(
+            ["concurrent-state-update"],
+            [error for _, error in outcomes if error is not None],
+        )
+        persisted = self.state()
+        self.assertEqual(initial_revision + 1, persisted["_state_revision"])
+        self.assertIn(persisted["validation"]["writer"], (0, 1))
+
+    def test_lost_reservation_ack_replays_after_restart_before_delivery(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        identity = self.role_operation_identity(self.state())
+        original_write_json = workflow._write_json
+
+        def persist_then_lose_ack(path, payload):
+            original_write_json(path, payload)
+            if path.name == "state.json":
+                raise RuntimeError("injected after atomic replace")
+
+        with mock.patch.object(
+            workflow, "_write_json", side_effect=persist_then_lose_ack
+        ):
+            with self.assertRaises(RuntimeError):
+                self.admit_role_operation(ISSUE, identity)
+
+        persisted = self.state()
+        self.assertEqual(1, len(persisted["role_ops"]))
+        reserved = next(iter(persisted["role_ops"].values()))
+        self.assertEqual("reserved", reserved["status"])
+        script = """
+import json
+import pathlib
+import sys
+from scripts import agent_workflow as workflow
+root = pathlib.Path(sys.argv[1])
+issue = int(sys.argv[2])
+config = workflow._load_config(root)
+state = workflow._read_state(root, config, issue)
+identity = json.loads(sys.argv[3])
+replayed = workflow._admit_role_operation(
+    root, config, issue, identity
+)
+print(json.dumps(replayed, sort_keys=True))
+"""
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(self.root),
+                str(ISSUE),
+                json.dumps(identity),
+            ],
+            cwd=pathlib.Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(reserved, json.loads(completed.stdout))
+        persisted = self.state()
+        self.assertEqual(
+            "reserved", persisted["role_ops"][reserved["op_id"]]["status"]
+        )
+        self.assertEqual({reserved["op_id"]}, set(persisted["role_ops"]))
+
+    def test_dispatched_operation_is_accepted_after_restart(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        reserved = self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        dispatched = self.apply_role_operation_transition(
+            ISSUE,
+            self.verified_role_operation_transition(reserved, "dispatched"),
+        )
+        script = """
+import json
+import pathlib
+import sys
+from scripts import agent_workflow as workflow
+root = pathlib.Path(sys.argv[1])
+issue = int(sys.argv[2])
+config = workflow._load_config(root)
+state = workflow._read_state(root, config, issue)
+record = state["role_ops"][sys.argv[3]]
+transition = workflow._GovernanceVerifiedRoleOperationTransition(
+    run_id=record["run_id"],
+    op_id=record["op_id"],
+    request_fp=record["request_fp"],
+    expected_state_revision=record["state_revision"],
+    from_status=record["status"],
+    to_status="succeeded",
+    result={"verified": True},
+    failure_reason=None,
+)
+accepted = workflow._apply_verified_role_operation_transition(
+    root, config, issue, transition
+)
+print(json.dumps(accepted, sort_keys=True))
+"""
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(self.root),
+                str(ISSUE),
+                dispatched["op_id"],
+            ],
+            cwd=pathlib.Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        accepted = json.loads(completed.stdout)
+        self.assertEqual("succeeded", accepted["status"])
+        self.assertEqual({"verified": True}, accepted["result"])
+        persisted = self.state()["role_ops"][dispatched["op_id"]]
+        self.assertEqual(accepted, persisted)
+        self.assertEqual(
+            accepted["state_revision"], self.state()["_state_revision"]
+        )
 
     def test_init_rejects_detached_head_even_at_target_without_state(self):
         """A detached target commit is not a publishable workflow head."""
@@ -8246,6 +9359,7 @@ class AgentWorkflowTest(unittest.TestCase):
         self.assertIsNone(revised["approved_scope"])
         self.assertIsNone(revised["approvals"]["plan"])
         request = revised["plan_revision_requests"][0]
+        self.assertEqual(revised["_state_revision"], request["state_revision"])
         self.assertEqual(prior["artifacts"]["plan"], request["prior_plan"])
         self.assertEqual("test-implementer", request["requested_by"])
         self.assertEqual("approved-plan-defect", request["reason_code"])
@@ -10085,9 +11199,16 @@ class RevisionAndPrRevisionTest(AgentWorkflowTest):
         self.assertEqual(0, code)
         self.assertEqual("PLANNING", payload["status"])
         child_state = self.state_for(self.CHILD_ISSUE)
+        self.assertRegex(child_state["run_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual("managed-v0", child_state["role_execution_mode"])
         self.assertIsNone(child_state["approved_scope"])
         self.assertIsNone(child_state["approvals"]["plan"])
         self.assertIsNone(child_state["approvals"]["tests"])
+        operation = self.admit_role_operation(
+            self.CHILD_ISSUE,
+            self.role_operation_identity(child_state),
+        )
+        self.assertEqual(child_state["run_id"], operation["run_id"])
 
     def test_submit_implementation_rejects_non_cosmetic_change_for_cosmetic_revision(self):
         self.bootstrap_completed_parent(self.PARENT_ISSUE)
