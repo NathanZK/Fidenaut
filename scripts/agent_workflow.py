@@ -8,6 +8,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -25,6 +26,11 @@ else:
 
 STATE_FORMAT = "chess-echo-skill-workflow-state-v1"
 CONFIG_FORMAT = "chess-echo-skill-workflow-config-v1"
+ROLE_EXECUTION_MODES = ("managed-v0", "executor-v1")
+ROLE_OPERATION_FORMAT = "fidenaut-role-op-v1"
+ROLE_OPERATION_STATUSES = ("reserved", "dispatched", "succeeded", "failed", "unknown")
+OPEN_ROLE_OPERATION_STATUSES = frozenset(("reserved", "dispatched", "unknown"))
+TERMINAL_ROLE_OPERATION_STATUSES = frozenset(("succeeded", "failed"))
 
 READY = "READY_FOR_HUMAN_APPROVAL"
 REVISION = "NEEDS_REVISION"
@@ -153,6 +159,39 @@ class WorkflowError(Exception):
         self.message = message
 
 
+class _GovernanceVerifiedRoleOperationTransition:
+    __slots__ = (
+        "run_id",
+        "op_id",
+        "request_fp",
+        "expected_state_revision",
+        "from_status",
+        "to_status",
+        "result",
+        "failure_reason",
+    )
+
+    def __init__(
+        self,
+        run_id,
+        op_id,
+        request_fp,
+        expected_state_revision,
+        from_status,
+        to_status,
+        result=None,
+        failure_reason=None,
+    ):
+        self.run_id = run_id
+        self.op_id = op_id
+        self.request_fp = request_fp
+        self.expected_state_revision = expected_state_revision
+        self.from_status = from_status
+        self.to_status = to_status
+        self.result = result
+        self.failure_reason = failure_reason
+
+
 # ---------- core helpers ----------
 
 
@@ -169,13 +208,28 @@ def _ensure(condition, code, message):
         _raise(code, message)
 
 
+def _json_object_without_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        _ensure(
+            key not in result,
+            "invalid-json",
+            "JSON object contains duplicate key %r" % key,
+        )
+        result[key] = value
+    return result
+
+
 def _read_json(path, label):
     """Read one required JSON object and convert malformed input to workflow errors."""
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_json_object_without_duplicate_keys,
+        )
     except FileNotFoundError:
         _raise("missing-file", "%s is missing: %s" % (label, path))
-    except json.JSONDecodeError as error:
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
         _raise(
             "invalid-json",
             "%s at %s is not valid JSON (%s)" % (label, path, error),
@@ -271,6 +325,20 @@ def _role_work_lock(root, config, issue):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def _role_operation_ids_lock(root, config):
+    """Serialize global role-operation ID checks and admission writes."""
+    artifact_root = _artifact_root(root, config)
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    lock_path = artifact_root / ".role-operation-ids.lock"
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 ROLE_WORK_STAGES = {
     "PLANNING": ("planner", "plan", "plan_review"),
     "PLAN_REVIEW": ("reviewer", "plan_review", "plan"),
@@ -282,7 +350,87 @@ ROLE_WORK_STAGES = {
 
 
 def _managed_role_work(config):
-    return config["workflow"].get("role_execution_contexts", False)
+    return (
+        _configured_role_execution_mode(config) == "managed-v0"
+        and config["workflow"].get("role_execution_contexts", False)
+    )
+
+
+def _configured_role_execution_mode(config):
+    workflow = config["workflow"]
+    mode_is_set = "role_execution" in workflow
+    mode = workflow.get("role_execution")
+    legacy_enabled = workflow.get("role_execution_contexts", False)
+    _ensure(
+        type(legacy_enabled) is bool,
+        "invalid-config",
+        "workflow.role_execution_contexts must be a boolean",
+    )
+    _ensure(
+        not mode_is_set or mode in ROLE_EXECUTION_MODES,
+        "invalid-config",
+        "workflow.role_execution must be one of %s"
+        % ", ".join(ROLE_EXECUTION_MODES),
+    )
+    _ensure(
+        not (legacy_enabled and mode == "executor-v1"),
+        "invalid-config",
+        "workflow.role_execution_contexts=true conflicts with executor-v1",
+    )
+    return mode if mode_is_set else "managed-v0"
+
+
+def _state_role_execution_mode(config, state):
+    configured_mode = _configured_role_execution_mode(config)
+    if "role_execution_mode" in state:
+        mode = state["role_execution_mode"]
+        _ensure(
+            mode in ROLE_EXECUTION_MODES,
+            "invalid-state",
+            "workflow run has an invalid role execution mode",
+        )
+        run_id = state.get("run_id")
+        _ensure(
+            isinstance(run_id, str) and re.fullmatch(r"[0-9a-f]{32}", run_id),
+            "invalid-state",
+            "workflow run identity is invalid",
+        )
+    else:
+        contexts = state.get("role_contexts")
+        unambiguous_legacy = (
+            isinstance(contexts, dict)
+            and bool(contexts)
+            and all(
+                isinstance(binding, dict)
+                and isinstance(binding.get("instance_id"), str)
+                and binding["instance_id"]
+                and "context_id" not in binding
+                and "provider_session_id" not in binding
+                for binding in contexts.values()
+            )
+        )
+        _ensure(
+            unambiguous_legacy,
+            "ambiguous-role-execution-mode",
+            "legacy workflow state does not identify one execution mode",
+        )
+        mode = "managed-v0"
+    _ensure(
+        mode == configured_mode,
+        "role-execution-mode-mismatch",
+        "configured role execution mode does not match the immutable run mode",
+    )
+    return mode
+
+
+def _require_role_execution_mode(config, state, required_mode):
+    mode = _state_role_execution_mode(config, state)
+    _ensure(
+        mode == required_mode,
+        "role-execution-mode-unsupported",
+        "this command requires the %s execution mode" % required_mode,
+    )
+    return mode
 
 
 def _role_context(root, config, state, role):
@@ -331,6 +479,7 @@ def _command_run_role_locked(args, root, config):
         "--operation-id must be a nonempty string",
     )
     state = _read_state(root, config, args.issue)
+    _require_role_execution_mode(config, state, "managed-v0")
     _require_revision_capacity(state, config)
     _ensure(_managed_role_work(config), "role-runtime-disabled", "managed role work is not configured")
     role, output_kind, input_kind = ROLE_WORK_STAGES.get(state["status"], (None, None, None))
@@ -695,6 +844,7 @@ def _reconcile_replaced_pending_role_work(
 def _command_replace_role_context_locked(args, root, config):
     """Explicitly replace an unavailable execution without rewriting its lineage."""
     state = _read_state(root, config, args.issue)
+    _require_role_execution_mode(config, state, "managed-v0")
     _ensure(state["status"] in ROLE_WORK_STAGES, "invalid-transition", "role replacement is not available at this gate")
     role, _, _ = ROLE_WORK_STAGES[state["status"]]
     _ensure(args.role == role and args.by.strip(), "invalid-role-recovery", "replacement requires the current role and requester")
@@ -808,6 +958,16 @@ def _read_state(root, config, issue):
         "invalid-state",
         "Workflow review revision counts are invalid",
     )
+    if "role_execution_mode" in state:
+        _ensure(
+            state.get("role_execution_mode") in ROLE_EXECUTION_MODES
+            and isinstance(state.get("run_id"), str)
+            and re.fullmatch(r"[0-9a-f]{32}", state["run_id"]),
+            "invalid-state",
+            "workflow run identity or role execution mode is invalid",
+        )
+    if "role_ops" in state:
+        _validate_role_operation_records(state)
     return state
 
 
@@ -855,6 +1015,605 @@ def _write_state(root, config, issue, state):
             )
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _validate_role_operation_json(value, context):
+    if value is None or type(value) in (bool, int, str):
+        return
+    if type(value) is float:
+        _ensure(
+            math.isfinite(value),
+            "invalid-role-operation-identity",
+            "%s contains a non-finite number" % context,
+        )
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_role_operation_json(item, context)
+        return
+    if isinstance(value, dict):
+        _ensure(
+            all(isinstance(key, str) for key in value),
+            "invalid-role-operation-identity",
+            "%s contains a non-string object key" % context,
+        )
+        for item in value.values():
+            _validate_role_operation_json(item, context)
+        return
+    _raise(
+        "invalid-role-operation-identity",
+        "%s contains a value that is not JSON data" % context,
+    )
+
+
+def _canonical_role_operation_identity(identity):
+    required = (
+        "issue", "run_id", "mode", "gate", "revision", "role", "binding",
+        "purpose", "inputs", "request",
+    )
+    _ensure(
+        isinstance(identity, dict)
+        and all(key in identity for key in required),
+        "invalid-role-operation-identity",
+        "role-operation request identity is incomplete",
+    )
+    _validate_role_operation_json(identity, "role-operation request identity")
+    _ensure(
+        isinstance(identity["issue"], int)
+        and not isinstance(identity["issue"], bool)
+        and identity["issue"] > 0,
+        "invalid-role-operation-identity",
+        "role-operation issue must be a positive integer",
+    )
+    _ensure(
+        isinstance(identity["run_id"], str)
+        and re.fullmatch(r"[0-9a-f]{32}", identity["run_id"]),
+        "invalid-role-operation-identity",
+        "role-operation run_id is invalid",
+    )
+    _ensure(
+        identity["mode"] in ROLE_EXECUTION_MODES,
+        "invalid-role-operation-identity",
+        "role-operation mode is invalid",
+    )
+    _ensure(
+        isinstance(identity["gate"], str)
+        and identity["gate"] in ROLE_WORK_STAGES,
+        "invalid-role-operation-identity",
+        "role-operation gate is invalid",
+    )
+    _ensure(
+        isinstance(identity["revision"], int)
+        and not isinstance(identity["revision"], bool)
+        and identity["revision"] >= 0,
+        "invalid-role-operation-identity",
+        "role-operation revision is invalid",
+    )
+    _ensure(
+        isinstance(identity["role"], str) and identity["role"],
+        "invalid-role-operation-identity",
+        "role-operation role is invalid",
+    )
+    _ensure(
+        isinstance(identity["binding"], dict) and identity["binding"],
+        "invalid-role-operation-identity",
+        "role-operation binding must be a non-empty object",
+    )
+    _ensure(
+        isinstance(identity["purpose"], str) and identity["purpose"].strip(),
+        "invalid-role-operation-identity",
+        "role-operation purpose is invalid",
+    )
+    _ensure(
+        isinstance(identity["inputs"], list)
+        and isinstance(identity["request"], dict),
+        "invalid-role-operation-identity",
+        "role-operation inputs and request must be an array and object",
+    )
+    has_prior = "prior_op" in identity
+    has_authorization = "authorization" in identity
+    _ensure(
+        has_prior == has_authorization
+        and (
+            not has_prior
+            or isinstance(identity["prior_op"], str)
+            and re.fullmatch(r"[0-9a-f]{32}", identity["prior_op"])
+            and isinstance(identity["authorization"], dict)
+        ),
+        "invalid-role-operation-identity",
+        "role-operation prior authorization is malformed",
+    )
+    try:
+        canonical = json.dumps(
+            identity,
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        _raise(
+            "invalid-role-operation-identity",
+            "role-operation request identity cannot be canonicalized: %s" % error,
+        )
+    fingerprint = hashlib.sha256(canonical.encode("ascii")).hexdigest()
+    return canonical, fingerprint
+
+
+def _role_operation_authorization_event(state, authorization, identity, prior):
+    _ensure(
+        isinstance(authorization, dict)
+        and authorization.get("kind")
+        in ("plan_revision_request", "revision_authorization")
+        and isinstance(authorization.get("index"), int)
+        and not isinstance(authorization.get("index"), bool)
+        and authorization["index"] >= 1
+        and isinstance(authorization.get("record"), dict)
+        and authorization.get("prior_op") == prior["op_id"]
+        and authorization.get("gate") == identity["gate"]
+        and authorization.get("revision") == identity["revision"],
+        "role-operation-prior-authorization-invalid",
+        "role-operation authorization must bind its event to the prior operation, gate, and revision",
+    )
+    events_key = {
+        "plan_revision_request": "plan_revision_requests",
+        "revision_authorization": "revision_authorizations",
+    }[authorization["kind"]]
+    events = state.get(events_key, [])
+    _ensure(
+        isinstance(events, list)
+        and authorization["index"] <= len(events)
+        and events[authorization["index"] - 1] == authorization["record"],
+        "role-operation-prior-authorization-invalid",
+        "role-operation authorization is stale or does not match persisted governance history",
+    )
+    event = authorization["record"]
+    if authorization["kind"] == "plan_revision_request":
+        _ensure(
+            identity["gate"] == "PLANNING"
+            and identity["role"] == "planner"
+            and event.get("from_status") == "TEST_IMPLEMENTATION"
+            and isinstance(event.get("requested_by"), str)
+            and event["requested_by"].strip()
+            and isinstance(event.get("reason_code"), str)
+            and event["reason_code"]
+            and event.get("state_revision") == identity["revision"],
+            "role-operation-prior-authorization-invalid",
+            "plan revision authorization does not match this gate and revision",
+        )
+    else:
+        authorized_gate = event.get("gate")
+        producer_status = (
+            REVIEW_GATES.get(authorized_gate, (None,))[0]
+            if isinstance(authorized_gate, str)
+            else None
+        )
+        expected_role = (
+            ROLE_WORK_STAGES.get(producer_status, (None,))[0]
+            if producer_status is not None
+            else None
+        )
+        _ensure(
+            event.get("kind") == LOCAL_ACKNOWLEDGMENT_KIND
+            and isinstance(event.get("asserted_by"), str)
+            and event["asserted_by"].strip()
+            and event.get("confirmation") == REVISION_CONFIRMATION
+            and identity["gate"] == producer_status
+            and identity["role"] == expected_role
+            and event.get("state_revision") == identity["revision"],
+            "role-operation-prior-authorization-invalid",
+            "revision authorization does not match this gate and revision",
+        )
+    return event
+
+
+def _validate_role_operation_records(state):
+    records = state.get("role_ops", {})
+    _ensure(
+        isinstance(records, dict),
+        "invalid-role-operation-record",
+        "workflow role_ops must be an object",
+    )
+    run_id = state.get("run_id")
+    request_fingerprints = set()
+    for op_id, record in records.items():
+        _ensure(
+            isinstance(op_id, str)
+            and re.fullmatch(r"[0-9a-f]{32}", op_id)
+            and isinstance(record, dict)
+            and record.get("format") == ROLE_OPERATION_FORMAT
+            and record.get("op_id") == op_id
+            and record.get("run_id") == run_id
+            and record.get("mode") in ROLE_EXECUTION_MODES
+            and record.get("mode") == state.get("role_execution_mode")
+            and record.get("status") in ROLE_OPERATION_STATUSES
+            and isinstance(record.get("delivery_attempt"), int)
+            and not isinstance(record.get("delivery_attempt"), bool)
+            and record["delivery_attempt"] >= 1
+            and isinstance(record.get("state_revision"), int)
+            and not isinstance(record.get("state_revision"), bool)
+            and record["state_revision"] >= 0
+            and record["state_revision"] <= state.get("_state_revision", 0),
+            "invalid-role-operation-record",
+            "workflow role operation %s is malformed" % op_id,
+        )
+        _, expected_fingerprint = _canonical_role_operation_identity(
+            record.get("request_identity")
+        )
+        _ensure(
+            record.get("request_fp") == expected_fingerprint
+            and record["request_identity"]["run_id"] == run_id
+            and record["request_identity"]["mode"] == record["mode"]
+            and record.get("gate") == record["request_identity"]["gate"]
+            and record.get("role") == record["request_identity"]["role"],
+            "invalid-role-operation-record",
+            "workflow role operation %s has a conflicting identity" % op_id,
+        )
+        _ensure(
+            record.get("prior_op")
+            == record["request_identity"].get("prior_op")
+            and record["request_fp"] not in request_fingerprints,
+            "invalid-role-operation-record",
+            "workflow role operation %s duplicates or mislinks a request" % op_id,
+        )
+        request_fingerprints.add(record["request_fp"])
+        if record["status"] in ("reserved", "dispatched", "unknown"):
+            _ensure(
+                record.get("result") is None
+                and record.get("failure_reason") is None,
+                "invalid-role-operation-record",
+                "open workflow role operation %s contains terminal data" % op_id,
+            )
+        elif record["status"] == "succeeded":
+            _ensure(
+                isinstance(record.get("result"), dict)
+                and record.get("failure_reason") is None,
+                "invalid-role-operation-record",
+                "successful workflow role operation %s is malformed" % op_id,
+            )
+        else:
+            _ensure(
+                isinstance(record.get("failure_reason"), str)
+                and record["failure_reason"]
+                and record.get("result") is None,
+                "invalid-role-operation-record",
+                "failed workflow role operation %s is malformed" % op_id,
+            )
+    _ensure(
+        sum(
+            record["status"] in OPEN_ROLE_OPERATION_STATUSES
+            for record in records.values()
+        )
+        <= 1,
+        "invalid-role-operation-record",
+        "workflow run contains more than one open role operation",
+    )
+    latest_by_role_purpose = {}
+    latest_by_role = {}
+    used_authorizations = set()
+    ordered_records = sorted(
+        records.values(), key=lambda item: item["state_revision"]
+    )
+    for record in ordered_records:
+        identity = record["request_identity"]
+        role_prior = latest_by_role.get(record["role"])
+        purpose_key = (record["role"], identity["purpose"])
+        purpose_prior = latest_by_role_purpose.get(purpose_key)
+        _ensure(
+            role_prior is None
+            or role_prior["status"] in TERMINAL_ROLE_OPERATION_STATUSES,
+            "invalid-role-operation-record",
+            "role operation %s follows an open operation for the same role"
+            % record["op_id"],
+        )
+        prior = purpose_prior
+        if (
+            role_prior is not None
+            and role_prior["status"] == "failed"
+            and (
+                prior is None
+                or role_prior["state_revision"] > prior["state_revision"]
+            )
+        ):
+            prior = role_prior
+        if prior is None:
+            _ensure(
+                record.get("prior_op") is None
+                and "authorization" not in identity,
+                "invalid-role-operation-record",
+                "role operation %s has an orphaned prior-operation link"
+                % record["op_id"],
+            )
+        else:
+            _ensure(
+                prior["status"] in TERMINAL_ROLE_OPERATION_STATUSES
+                and record.get("prior_op") == prior["op_id"],
+                "invalid-role-operation-record",
+                "role operation %s does not link to the prior terminal operation"
+                % record["op_id"],
+            )
+            authorization = identity.get("authorization")
+            _role_operation_authorization_event(
+                state, authorization, identity, prior
+            )
+            authorization_key = (
+                authorization["kind"], authorization["index"]
+            )
+            _ensure(
+                authorization_key not in used_authorizations,
+                "invalid-role-operation-record",
+                "role operation %s reuses a governance authorization event"
+                % record["op_id"],
+            )
+            used_authorizations.add(authorization_key)
+        latest_by_role_purpose[purpose_key] = record
+        latest_by_role[record["role"]] = record
+    return records
+
+
+def _role_operation_record_paths(root, config):
+    artifact_root = _artifact_root(root, config)
+    paths = list(artifact_root.glob("issue-*/state.json"))
+    paths.extend((artifact_root / "superseded").glob("*/state.json"))
+    return sorted(paths)
+
+
+def _all_role_operation_ids(root, config):
+    op_ids = set()
+    for path in _role_operation_record_paths(root, config):
+        state = _read_json(path, "workflow state")
+        records = _validate_role_operation_records(state)
+        for op_id in records:
+            _ensure(
+                op_id not in op_ids,
+                "duplicate-role-operation-id",
+                "role operation ID %s is present in more than one run" % op_id,
+            )
+            op_ids.add(op_id)
+    return op_ids
+
+
+def _admit_role_operation(root, config, issue, request_identity):
+    """Reserve one immutable governance operation without invoking a runtime."""
+    with _role_operation_ids_lock(root, config):
+        with _role_work_lock(root, config, issue):
+            state = _read_state(root, config, issue)
+            mode = _state_role_execution_mode(config, state)
+            _ensure(
+                isinstance(state.get("run_id"), str),
+                "invalid-state",
+                "new role operations require an explicit workflow run_id",
+            )
+            canonical, request_fp = _canonical_role_operation_identity(
+                request_identity
+            )
+            identity = json.loads(canonical)
+            _ensure(
+                identity["issue"] == issue
+                and identity["run_id"] == state["run_id"]
+                and identity["mode"] == mode
+                and identity["gate"] == state["status"],
+                "role-operation-identity-mismatch",
+                "role-operation identity does not match the current run",
+            )
+            expected_role = ROLE_WORK_STAGES.get(state["status"], (None,))[0]
+            _ensure(
+                expected_role is not None and identity["role"] == expected_role,
+                "role-operation-role-mismatch",
+                "role operation is not assigned to the current gate role",
+            )
+            records = _validate_role_operation_records(state)
+            for record in records.values():
+                if record["request_fp"] == request_fp:
+                    _ensure(
+                        record["request_identity"] == identity,
+                        "role-operation-fingerprint-conflict",
+                        "role-operation fingerprint maps to different request identity",
+                    )
+                    return json.loads(json.dumps(record))
+            _ensure(
+                not any(
+                    record["status"] in OPEN_ROLE_OPERATION_STATUSES
+                    for record in records.values()
+                ),
+                "role-operation-pending",
+                "another role operation is still open for this run",
+            )
+            _ensure(
+                identity["revision"] == state.get("_state_revision", 0),
+                "stale-role-operation-revision",
+                "role-operation request was prepared from a stale workflow revision",
+            )
+            prior_records = [
+                record for record in records.values()
+                if record["role"] == identity["role"]
+                and record["request_identity"]["purpose"] == identity["purpose"]
+            ]
+            prior = (
+                max(prior_records, key=lambda record: record["state_revision"])
+                if prior_records
+                else None
+            )
+            latest_role_record = max(
+                (
+                    record for record in records.values()
+                    if record["role"] == identity["role"]
+                ),
+                key=lambda record: record["state_revision"],
+                default=None,
+            )
+            if (
+                latest_role_record is not None
+                and latest_role_record["status"] == "failed"
+                and (
+                    prior is None
+                    or latest_role_record["state_revision"]
+                    > prior["state_revision"]
+                )
+            ):
+                prior = latest_role_record
+            prior_op = None
+            if prior is not None:
+                _ensure(
+                    prior["status"] in TERMINAL_ROLE_OPERATION_STATUSES
+                    and identity.get("prior_op") == prior["op_id"],
+                    "role-operation-prior-authorization-required",
+                    "a new role operation requires authorization linked to the prior terminal operation",
+                )
+                _role_operation_authorization_event(
+                    state, identity.get("authorization"), identity, prior
+                )
+                prior_op = prior["op_id"]
+            else:
+                _ensure(
+                    "prior_op" not in identity and "authorization" not in identity,
+                    "role-operation-prior-authorization-invalid",
+                    "role operation has a prior authorization without a prior operation",
+                )
+            _ensure(
+                isinstance(identity["binding"].get("generation", 1), int)
+                and not isinstance(identity["binding"].get("generation", 1), bool)
+                and identity["binding"].get("generation", 1) >= 1,
+                "invalid-role-operation-identity",
+                "role-operation binding generation must be positive",
+            )
+            op_id = uuid.uuid4().hex
+            _ensure(
+                re.fullmatch(r"[0-9a-f]{32}", op_id) is not None,
+                "invalid-role-operation-id",
+                "Fidenaut generated an invalid role operation ID",
+            )
+            op_ids = _all_role_operation_ids(root, config)
+            _ensure(
+                op_id not in op_ids,
+                "duplicate-role-operation-id",
+                "Fidenaut generated a role operation ID already used by another run",
+            )
+            next_revision = state.get("_state_revision", 0) + 1
+            record = {
+                "format": ROLE_OPERATION_FORMAT,
+                "op_id": op_id,
+                "run_id": state["run_id"],
+                "mode": mode,
+                "gate": state["status"],
+                "role": identity["role"],
+                "request_identity": identity,
+                "request_fp": request_fp,
+                "state_revision": next_revision,
+                "delivery_attempt": 1,
+                "status": "reserved",
+                "prior_op": prior_op,
+                "result": None,
+                "failure_reason": None,
+            }
+            state.setdefault("role_ops", {})[op_id] = record
+            _write_state(root, config, issue, state)
+            return json.loads(json.dumps(record))
+
+
+def _apply_verified_role_operation_transition(
+    root, config, issue, transition
+):
+    """Persist one typed governance decision for an existing role operation."""
+    _ensure(
+        type(transition) is _GovernanceVerifiedRoleOperationTransition,
+        "unverified-role-operation-transition",
+        "role-operation transition requires an internal governance verification result",
+    )
+    with _role_work_lock(root, config, issue):
+        state = _read_state(root, config, issue)
+        mode = _state_role_execution_mode(config, state)
+        records = _validate_role_operation_records(state)
+        record = records.get(transition.op_id)
+        _ensure(
+            isinstance(record, dict)
+            and record.get("run_id") == transition.run_id == state.get("run_id")
+            and record.get("mode") == mode
+            and record.get("request_fp") == transition.request_fp,
+            "role-operation-identity-mismatch",
+            "governance transition does not match the persisted operation",
+        )
+        if record["status"] in TERMINAL_ROLE_OPERATION_STATUSES:
+            _ensure(
+                transition.to_status == record["status"]
+                and transition.result == record.get("result")
+                and transition.failure_reason == record.get("failure_reason")
+                and transition.from_status in ("dispatched", "unknown")
+                and transition.expected_state_revision
+                == record["state_revision"] - 1,
+                "terminal-role-operation-immutable",
+                "terminal role operation cannot be changed",
+            )
+            return json.loads(json.dumps(record))
+        _ensure(
+            transition.from_status == record["status"],
+            "role-operation-transition-conflict",
+            "role-operation status changed before governance acceptance",
+        )
+        _ensure(
+            state.get("status") == record["gate"]
+            and record["request_identity"]["issue"] == issue,
+            "role-operation-identity-mismatch",
+            "workflow gate or issue changed before governance acceptance",
+        )
+        _ensure(
+            state.get("_state_revision", 0) == record["state_revision"]
+            and transition.expected_state_revision == record["state_revision"],
+            "stale-role-operation-revision",
+            "workflow state changed after role-operation admission",
+        )
+        transitions = {
+            "reserved": frozenset(("dispatched", "unknown")),
+            "dispatched": frozenset(("unknown", "succeeded", "failed")),
+            "unknown": frozenset(("unknown", "dispatched", "succeeded", "failed")),
+        }
+        _ensure(
+            transition.to_status in transitions.get(record["status"], ()),
+            "invalid-role-operation-transition",
+            "role operation cannot transition from %s to %s"
+            % (record["status"], transition.to_status),
+        )
+        _ensure(
+            transition.to_status in ROLE_OPERATION_STATUSES,
+            "invalid-role-operation-transition",
+            "role operation target status is invalid",
+        )
+        if transition.to_status == "succeeded":
+            _ensure(
+                isinstance(transition.result, dict)
+                and transition.failure_reason is None,
+                "invalid-role-operation-transition",
+                "successful governance transition requires a result object",
+            )
+            _validate_role_operation_json(
+                transition.result, "verified role-operation result"
+            )
+        elif transition.to_status == "failed":
+            _ensure(
+                isinstance(transition.failure_reason, str)
+                and transition.failure_reason.strip()
+                and transition.result is None,
+                "invalid-role-operation-transition",
+                "failed governance transition requires a failure reason",
+            )
+        else:
+            _ensure(
+                transition.result is None and transition.failure_reason is None,
+                "invalid-role-operation-transition",
+                "non-terminal governance transition cannot contain a result",
+            )
+        if transition.to_status == record["status"]:
+            return json.loads(json.dumps(record))
+        record["status"] = transition.to_status
+        record["result"] = (
+            json.loads(json.dumps(transition.result))
+            if transition.result is not None
+            else None
+        )
+        record["failure_reason"] = transition.failure_reason
+        record["state_revision"] = state.get("_state_revision", 0) + 1
+        _write_state(root, config, issue, state)
+        return json.loads(json.dumps(record))
 
 
 def _expect_status(state, expected, operation):
@@ -939,6 +1698,7 @@ def command_authorize_revision(args, root, config):
         "consecutive_count": decision["consecutive_count"],
         "limit": decision["limit"],
         "review_artifact": decision["review_artifact"],
+        "state_revision": state.get("_state_revision", 0) + 1,
     })
     _reset_revision_count(state, args.gate)
     _write_state(root, config, args.issue, state)
@@ -1140,6 +1900,7 @@ def _load_config(root):
         "invalid-config-format",
         "workflow.format must be %s" % CONFIG_FORMAT,
     )
+    _configured_role_execution_mode(config)
     _ensure(
         isinstance(config.get("target_base"), str) and config["target_base"],
         "invalid-config",
@@ -5836,6 +6597,8 @@ def command_init(args, root, config):
     state = {
         "format": STATE_FORMAT,
         "issue": args.issue,
+        "run_id": uuid.uuid4().hex,
+        "role_execution_mode": _configured_role_execution_mode(config),
         "target_base": config["target_base"],
         "status": "PLANNING",
         "revision_counts": {gate: 0 for gate in REVIEW_GATES},
@@ -6113,6 +6876,8 @@ def _start_revision_run(
     state = {
         "format": STATE_FORMAT,
         "issue": issue,
+        "run_id": uuid.uuid4().hex,
+        "role_execution_mode": _configured_role_execution_mode(config),
         "target_base": config["target_base"],
         "status": REVISION_ENTRY_STATUS[revision_class],
         "revision_counts": {gate: 0 for gate in REVIEW_GATES},
@@ -6497,6 +7262,7 @@ def command_request_plan_revision(args, root, config):
         "prior_test_failure": state.get("test_failure"),
         "prior_active_test_reopening": prior_active_test_reopening,
         "prior_test_approval_transition": archived_test_approval_transition,
+        "state_revision": state.get("_state_revision", 0) + 1,
     }
     state.setdefault("plan_revision_requests", []).append(request)
     state["approvals"]["plan"] = None

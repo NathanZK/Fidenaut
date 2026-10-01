@@ -39,6 +39,19 @@ A consumer must retain its own repository configuration. Do not copy Fidenaut's
 repository identity, remote, target branch, run root, or application
 validation profiles into another repository.
 
+## Role execution mode
+
+New workflow runs pin `workflow.role_execution` as `managed-v0` or
+`executor-v1`. If omitted, it defaults to `managed-v0`. The legacy
+`workflow.role_execution_contexts: true` setting continues to enable managed
+role execution and cannot be combined with `executor-v1`; setting it to false
+keeps managed role execution disabled.
+
+The selected mode is immutable for a run. Mode-sensitive commands reject a
+configuration/run mismatch before invoking a runtime. `executor-v1` is a
+governance mode selection only; this release does not include an executor or
+provider integration.
+
 ## Provider quickstart
 
 From a clean Fidenaut checkout, use Python 3.9 (the provider CI runtime):
@@ -171,3 +184,5 @@ to make publication pass.
   workflow architecture and trust boundaries.
 - [`docs/engineering/agent-workflow-maintainer-summary.md`](docs/engineering/agent-workflow-maintainer-summary.md):
   maintainer-oriented contracts and invariants.
+- [`docs/specs/role-operation-records.md`](docs/specs/role-operation-records.md):
+  pinned role-execution modes and governance-owned operation records.

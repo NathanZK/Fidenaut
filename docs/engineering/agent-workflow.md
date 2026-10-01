@@ -43,6 +43,14 @@ with:
   already-published completed run is reconciled onto an advanced target or
   escalated into an automatic governed revision)
 
+New runs persist a Fidenaut-generated `run_id` and immutable
+`role_execution_mode`. `workflow.role_execution` selects `managed-v0` or
+`executor-v1`; omitted configuration defaults to `managed-v0`. Legacy
+`role_execution_contexts: true` continues to enable managed execution and
+conflicts with explicit `executor-v1`. Governance-owned role-operation
+records, admission, and acceptance invariants are documented in
+[`role-operation-records.md`](../specs/role-operation-records.md).
+
 ### External provider runtime boundary
 
 An external consumer invokes a pinned Fidenaut runtime from a distinct
