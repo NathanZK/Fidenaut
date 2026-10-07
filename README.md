@@ -192,3 +192,5 @@ to make publication pass.
   the provider-neutral executor boundary and file-backed protocol fake.
 - [`docs/specs/copilot-provider-adapter.md`](docs/specs/copilot-provider-adapter.md):
   the fail-closed Copilot adapter contract and its qualification limits.
+- [`docs/specs/provider-qualification-evaluator.md`](docs/specs/provider-qualification-evaluator.md):
+  the bounded qualification evaluator API, evidence contract, and adoption limits.
