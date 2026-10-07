@@ -49,9 +49,10 @@ keeps managed role execution disabled.
 
 The selected mode is immutable for a run. Mode-sensitive commands reject a
 configuration/run mismatch before invoking a runtime. `executor-v1` is a
-governance mode selection only. The repository includes a file-backed
-protocol fake for tests, but it is not wired into workflow commands and does
-not provide a production executor or provider integration.
+governance mode selection only. The repository includes a file-backed protocol
+fake and testable Copilot CLI adapter code, but neither is wired into workflow
+commands. The Copilot adapter cannot create provider sessions, and no real
+provider integration or `executor-v1` adoption is enabled.
 
 ## Provider quickstart
 
@@ -189,3 +190,5 @@ to make publication pass.
   pinned role-execution modes and governance-owned operation records.
 - [`docs/specs/executor-protocol.md`](docs/specs/executor-protocol.md):
   the provider-neutral executor boundary and file-backed protocol fake.
+- [`docs/specs/copilot-provider-adapter.md`](docs/specs/copilot-provider-adapter.md):
+  the fail-closed Copilot adapter contract and its qualification limits.

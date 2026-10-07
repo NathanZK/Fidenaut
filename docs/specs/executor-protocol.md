@@ -7,7 +7,7 @@ convention: Python 3.9; provider code and unittest coverage live under `scripts/
 
 ## Contract
 
-- Implement the four mandatory executor operations in a provider-neutral module under `scripts/`: `create`, exact `resume`, identified `submit`, and repeatable `get_outcome`. Do not wire these operations into the workflow provider or add a real provider adapter.
+- Implement the four mandatory executor operations in a provider-neutral module under `scripts/`: `create`, exact `resume`, identified `submit`, and repeatable `get_outcome`. Keep this protocol implementation separate from provider adapters and do not wire it into workflow commands.
 - Accept the contract's context, request identity, operation, and observation fields without changing their meaning. Validate absolute normalized paths, request shape, input byte lengths, and SHA-256 digests before admission. Canonical request fingerprints use sorted-key, ASCII JSON with compact separators and SHA-256. A supplied fingerprint that does not match the submitted request is a conflict.
 - `create(creation_key, role, workspace_path)` is idempotent for the same key and same request; same key with changed parameters returns `CONFLICT`. Serialize same-key creation with a lock file named by a digest of the key; never put raw keys in paths. Persist the mapping from creation key to immutable context before returning it.
 - `resume(context_id)` addresses only that exact context and returns `AVAILABLE`, `BUSY`, `UNAVAILABLE`, or `UNKNOWN`; it never substitutes a context. A valid existing record with an existing bound workspace and free context lock is `AVAILABLE`; a held context lock is `BUSY`; a definitively absent context or workspace is `UNAVAILABLE`; corrupt state or inability to establish either condition is `UNKNOWN`. A missing workspace does not erase a terminal operation outcome.
@@ -20,6 +20,9 @@ convention: Python 3.9; provider code and unittest coverage live under `scripts/
 - Before `os.replace`, a failed write leaves the prior complete record authoritative and must not invoke the fake. After replace and successful directory `fsync`, the new record is durable. If write, replace, or either `fsync` reports failure, do not invoke or report success; on restart, validate the observed record strictly and fail closed if its state cannot be established. JSON with duplicate keys, unsupported versions/fields, invalid types, or cross-record identity mismatches is corrupt, not absent.
 - Records survive executor object/process restart for the caller's retention period. Never garbage-collect records as part of this implementation. Lock files may remain after release; lock ownership is the OS lock, not file presence or the E-record's diagnostic owner PID/start time.
 - The deterministic fake is a test adapter with separately durable invocation/effect counters and explicit fault injection immediately before/after each context and E-record write boundary, before invocation, after invocation, after an effect, before/after terminal persistence, before response, during restart, and with partial/corrupt/unavailable records. A crash after an effect but before terminal persistence leaves the E-record accepted/running; after locks release, lookup is `UNKNOWN`, with the fake's effect count preserved. It is contract evidence only, not provider, isolation, or production-durability qualification.
+
+Copilot CLI adapter: `docs/specs/copilot-provider-adapter.md`. The adapter is
+not connected to this protocol implementation or workflow commands.
 
 ## State transitions
 
