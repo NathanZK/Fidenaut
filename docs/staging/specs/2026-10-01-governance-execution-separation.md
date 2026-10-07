@@ -1,6 +1,6 @@
 # Governance / execution separation — architecture and deletion plan
 
-status: architecture proposal. It does not authorize implementation, select an executor or provider, or change workflow behavior.
+status: settled architectural direction for #80. Implementation must preserve the constraints and decisions recorded here.
 basis:
 - Fidenaut `main` @ `432cc34`, the code audited here.
 - #76 report and its credentialed continuity addendum.

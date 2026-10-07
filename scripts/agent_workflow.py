@@ -13,6 +13,7 @@ import os
 import pathlib
 import re
 import shlex
+import stat
 import subprocess
 import tempfile
 import time
@@ -1249,6 +1250,23 @@ def _validate_role_operation_records(state):
             "invalid-role-operation-record",
             "workflow role operation %s has a conflicting identity" % op_id,
         )
+        has_baseline = "baseline" in record
+        has_output_path = "output_path" in record
+        _ensure(
+            has_baseline == has_output_path
+            and record.get("role")
+            == ROLE_WORK_STAGES.get(record["gate"], (None,))[0],
+            "invalid-role-operation-record",
+            "workflow role operation %s has an invalid R5 binding" % op_id,
+        )
+        if has_baseline:
+            expected_role_output = _role_operation_output_relative_path(record)
+            _ensure(
+                record.get("output_path") == expected_role_output,
+                "invalid-role-operation-record",
+                "workflow role operation %s has a mismatched output binding"
+                % op_id,
+            )
         _ensure(
             record.get("prior_op")
             == record["request_identity"].get("prior_op")
@@ -1256,6 +1274,8 @@ def _validate_role_operation_records(state):
             "invalid-role-operation-record",
             "workflow role operation %s duplicates or mislinks a request" % op_id,
         )
+        if has_baseline:
+            _validate_role_operation_baseline(record.get("baseline"), op_id)
         request_fingerprints.add(record["request_fp"])
         if record["status"] in ("reserved", "dispatched", "unknown"):
             _ensure(
@@ -1271,6 +1291,8 @@ def _validate_role_operation_records(state):
                 "invalid-role-operation-record",
                 "successful workflow role operation %s is malformed" % op_id,
             )
+            if has_baseline:
+                _validate_role_operation_acceptance_result(record)
         else:
             _ensure(
                 isinstance(record.get("failure_reason"), str)
@@ -1351,6 +1373,154 @@ def _validate_role_operation_records(state):
     return records
 
 
+def _validate_role_operation_baseline(baseline, op_id):
+    _ensure(
+        isinstance(baseline, dict)
+        and isinstance(baseline.get("repo_identity"), dict)
+        and set(baseline["repo_identity"])
+        == {"worktree_root", "git_dir", "common_git_dir"}
+        and all(
+            isinstance(value, str) and pathlib.Path(value).is_absolute()
+            for value in baseline["repo_identity"].values()
+        )
+        and isinstance(baseline.get("repo_head"), str)
+        and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", baseline["repo_head"])
+        and isinstance(baseline.get("tree_digest"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", baseline["tree_digest"])
+        and isinstance(baseline.get("entries"), list),
+        "invalid-role-operation-record",
+        "workflow role operation %s has a malformed R5 baseline" % op_id,
+    )
+    previous_path = None
+    for entry in baseline["entries"]:
+        _ensure(
+            isinstance(entry, dict)
+            and isinstance(entry.get("path_b64"), str)
+            and isinstance(entry.get("kind"), str)
+            and isinstance(entry.get("byte_length"), int)
+            and not isinstance(entry.get("byte_length"), bool)
+            and entry["byte_length"] >= 0,
+            "invalid-role-operation-record",
+            "workflow role operation %s has a malformed baseline entry" % op_id,
+        )
+        try:
+            path = base64.b64decode(entry["path_b64"], validate=True)
+        except (ValueError, TypeError):
+            path = None
+        _ensure(
+            path
+            and base64.b64encode(path).decode("ascii") == entry["path_b64"]
+            and not path.startswith(b"/")
+            and all(part not in (b"", b".", b"..") for part in path.split(b"/"))
+            and (previous_path is None or previous_path < path),
+            "invalid-role-operation-record",
+            "workflow role operation %s has an invalid or unsorted baseline path"
+            % op_id,
+        )
+        previous_path = path
+        if entry["kind"] == "x":
+            valid_entry = (
+                entry.get("mode") is None
+                and entry.get("sha256") is None
+                and entry["byte_length"] == 0
+            )
+        else:
+            valid_entry = (
+                entry["kind"] in ("f", "l")
+                and entry.get("mode")
+                in (("120000",) if entry["kind"] == "l" else ("100644", "100755"))
+                and isinstance(entry.get("sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+            )
+        _ensure(
+            valid_entry,
+            "invalid-role-operation-record",
+            "workflow role operation %s has an invalid baseline file identity"
+            % op_id,
+        )
+
+
+def _validate_role_operation_acceptance_result(record):
+    result = record["result"]
+    artifact = result.get("accepted_artifact")
+    delta = result.get("accepted_delta")
+    _ensure(
+        set(result)
+        == {"executor_result", "accepted_artifact", "accepted_delta"}
+        and isinstance(result.get("executor_result"), dict)
+        and isinstance(artifact, dict)
+        and set(artifact) == {"path", "sha256", "byte_length"}
+        and artifact.get("path") == record.get("output_path")
+        and isinstance(artifact.get("sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"])
+        and isinstance(artifact.get("byte_length"), int)
+        and not isinstance(artifact.get("byte_length"), bool)
+        and artifact["byte_length"] >= 0
+        and isinstance(delta, list),
+        "invalid-role-operation-record",
+        "workflow role operation %s has malformed accepted evidence"
+        % record["op_id"],
+    )
+    previous_path = None
+    for entry in delta:
+        _ensure(
+            isinstance(entry, dict)
+            and set(entry) == {"path_b64", "change", "before", "after"}
+            and entry.get("change")
+            in ("added", "modified", "deleted", "mode", "symlink"),
+            "invalid-role-operation-record",
+            "workflow role operation %s has a malformed accepted delta"
+            % record["op_id"],
+        )
+        try:
+            path = base64.b64decode(entry.get("path_b64", ""), validate=True)
+        except (ValueError, TypeError):
+            path = None
+        _ensure(
+            path
+            and base64.b64encode(path).decode("ascii") == entry["path_b64"]
+            and not path.startswith(b"/")
+            and all(part not in (b"", b".", b"..") for part in path.split(b"/"))
+            and (previous_path is None or previous_path < path),
+            "invalid-role-operation-record",
+            "workflow role operation %s has an unsafe or unsorted accepted path"
+            % record["op_id"],
+        )
+        previous_path = path
+        for value in (entry["before"], entry["after"]):
+            if value is None:
+                continue
+            _ensure(
+                isinstance(value, dict)
+                and set(value) == {"kind", "mode", "sha256", "byte_length"}
+                and value.get("kind") in ("f", "l")
+                and value.get("mode")
+                in (("120000",) if value.get("kind") == "l" else ("100644", "100755"))
+                and isinstance(value.get("sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", value["sha256"])
+                and isinstance(value.get("byte_length"), int)
+                and not isinstance(value.get("byte_length"), bool)
+                and value["byte_length"] >= 0,
+                "invalid-role-operation-record",
+                "workflow role operation %s has malformed accepted path metadata"
+                % record["op_id"],
+            )
+
+
+def _role_operation_output_relative_path(record):
+    stage = ROLE_WORK_STAGES.get(record.get("gate"))
+    _ensure(
+        isinstance(record.get("op_id"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", record["op_id"])
+        and stage is not None
+        and isinstance(stage[1], str)
+        and stage[1],
+        "role-operation-output-path-invalid",
+        "role operation has no canonical output kind",
+    )
+    return pathlib.PurePosixPath("ops", record["op_id"], stage[1]).as_posix()
+
+
 def _role_operation_record_paths(root, config):
     artifact_root = _artifact_root(root, config)
     paths = list(artifact_root.glob("issue-*/state.json"))
@@ -1371,6 +1541,693 @@ def _all_role_operation_ids(root, config):
             )
             op_ids.add(op_id)
     return op_ids
+
+
+def _role_operation_git_output(root, config, *arguments):
+    completed = _run_checked(
+        _git_command(config, *arguments),
+        _effective_limits(config, "git"),
+        root,
+        "role-operation-baseline-git-failed",
+        "unable to capture role-operation repository baseline",
+    )
+    stream = completed["result"].get("stdout", {})
+    try:
+        output = base64.b64decode(stream.get("base64", ""), validate=True)
+    except (ValueError, TypeError) as error:
+        _raise(
+            "role-operation-baseline-invalid",
+            "Git returned malformed baseline output: %s" % error,
+        )
+    _ensure(
+        isinstance(stream.get("bytes"), int)
+        and isinstance(stream.get("observed_bytes"), int)
+        and len(output) == stream["bytes"] == stream["observed_bytes"],
+        "role-operation-baseline-incomplete",
+        "Git baseline output was truncated or incomplete",
+    )
+    return output
+
+
+def _role_operation_repo_identity(root, config):
+    root = pathlib.Path(root).resolve()
+    commands = (
+        ("worktree_root", ("rev-parse", "--show-toplevel")),
+        ("git_dir", ("rev-parse", "--absolute-git-dir")),
+        (
+            "common_git_dir",
+            ("rev-parse", "--path-format=absolute", "--git-common-dir"),
+        ),
+    )
+    identity = {}
+    for name, arguments in commands:
+        output = _role_operation_git_output(root, config, *arguments)
+        _ensure(
+            output.endswith(b"\n") and b"\n" not in output[:-1],
+            "role-operation-baseline-invalid",
+            "Git returned an invalid %s path" % name,
+        )
+        try:
+            value = pathlib.Path(os.fsdecode(output[:-1])).resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            _raise(
+                "role-operation-baseline-invalid",
+                "unable to resolve Git %s: %s" % (name, error),
+            )
+        identity[name] = str(value)
+    _ensure(
+        identity["worktree_root"] == str(root),
+        "role-operation-worktree-mismatch",
+        "role-operation workspace is not the Git worktree root",
+    )
+    head = _role_operation_git_output(root, config, "rev-parse", "--verify", "HEAD")
+    _ensure(
+        head.endswith(b"\n")
+        and re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})\n", head) is not None,
+        "role-operation-baseline-invalid",
+        "Git returned an invalid HEAD object ID",
+    )
+    return identity, head[:-1].decode("ascii")
+
+
+def _role_operation_status_paths(status):
+    _ensure(
+        not status or status.endswith(b"\0"),
+        "role-operation-baseline-invalid",
+        "Git status output is incomplete",
+    )
+    if not status:
+        return []
+    records = status[:-1].split(b"\0")
+    paths = set()
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if record.startswith(b"1 "):
+            fields = record.split(b" ", 8)
+            _ensure(
+                len(fields) == 9 and len(fields[1]) == 2
+                and all(value in b".MADRCTU" for value in fields[1])
+                and fields[2] == b"N..."
+                and fields[3] in (b"000000", b"100644", b"100755", b"120000")
+                and fields[4] in (b"000000", b"100644", b"100755", b"120000")
+                and fields[5] in (b"000000", b"100644", b"100755", b"120000")
+                and all(
+                    re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", value)
+                    for value in fields[6:8]
+                ),
+                "role-operation-baseline-invalid",
+                "Git returned a malformed or unsupported ordinary status record",
+            )
+            path = fields[8]
+        elif record.startswith(b"2 "):
+            fields = record.split(b" ", 9)
+            _ensure(
+                len(fields) == 10 and len(fields[1]) == 2
+                and all(value in b".MADRCTU" for value in fields[1])
+                and fields[2] == b"N..."
+                and fields[3] in (b"000000", b"100644", b"100755", b"120000")
+                and fields[4] in (b"000000", b"100644", b"100755", b"120000")
+                and fields[5] in (b"000000", b"100644", b"100755", b"120000")
+                and all(
+                    re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", value)
+                    for value in fields[6:8]
+                )
+                and re.fullmatch(rb"[RC](?:[1-9]?[0-9]|100)", fields[8])
+                and index < len(records),
+                "role-operation-baseline-invalid",
+                "Git returned a malformed or unsupported rename/copy status record",
+            )
+            path = fields[9]
+            original_path = records[index]
+            index += 1
+            _ensure(
+                original_path
+                and not original_path.startswith(b"/")
+                and all(
+                    part not in (b"", b".", b"..")
+                    for part in original_path.split(b"/")
+                ),
+                "role-operation-baseline-invalid",
+                "Git returned an unsafe original path in a rename/copy record",
+            )
+            paths.add(original_path)
+        elif record.startswith(b"u "):
+            fields = record.split(b" ", 10)
+            _ensure(
+                len(fields) == 11 and len(fields[1]) == 2
+                and all(value in b".MADRCTU" for value in fields[1])
+                and fields[2] == b"N..."
+                and all(
+                    mode in (b"000000", b"100644", b"100755", b"120000")
+                    for mode in fields[3:7]
+                ),
+                "role-operation-baseline-invalid",
+                "Git returned a malformed or unsupported unmerged status record",
+            )
+            _ensure(
+                all(
+                    re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", value)
+                    for value in fields[7:10]
+                ),
+                "role-operation-baseline-invalid",
+                "Git returned malformed object IDs in an unmerged status record",
+            )
+            path = fields[10]
+        elif record.startswith(b"? "):
+            path = record[2:]
+        else:
+            _raise(
+                "role-operation-baseline-invalid",
+                "Git returned an unsupported porcelain-v2 status record",
+            )
+        _ensure(
+            path
+            and not path.startswith(b"/")
+            and all(part not in (b"", b".", b"..") for part in path.split(b"/")),
+            "role-operation-baseline-invalid",
+            "Git returned an unsafe repository-relative path",
+        )
+        paths.add(path)
+    return sorted(paths)
+
+
+def _role_operation_stat_identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _role_operation_snapshot_entry(root, path_bytes, digest):
+    root = pathlib.Path(root).resolve()
+    path = root / os.fsdecode(path_bytes)
+    try:
+        parent = path.parent.resolve(strict=False)
+        parent.relative_to(root)
+        before = os.lstat(path)
+    except FileNotFoundError:
+        entry = {
+            "path_b64": base64.b64encode(path_bytes).decode("ascii"),
+            "kind": "x",
+            "mode": None,
+            "sha256": None,
+            "byte_length": 0,
+        }
+        digest.update(len(path_bytes).to_bytes(8, "big"))
+        digest.update(path_bytes)
+        digest.update(b"x000000")
+        digest.update((0).to_bytes(8, "big"))
+        return entry
+    except (OSError, RuntimeError, ValueError) as error:
+        _raise(
+            "role-operation-baseline-path-unreadable",
+            "unable to inspect baseline path %r: %s" % (path_bytes, error),
+        )
+
+    if stat.S_ISLNK(before.st_mode):
+        try:
+            target = os.fsencode(os.readlink(path))
+            after = os.lstat(path)
+        except OSError as error:
+            _raise(
+                "role-operation-baseline-path-unreadable",
+                "unable to read baseline symlink %r: %s" % (path_bytes, error),
+            )
+        _ensure(
+            _role_operation_stat_identity(before)
+            == _role_operation_stat_identity(after),
+            "role-operation-baseline-unstable",
+            "baseline symlink changed while it was being read",
+        )
+        kind = b"l"
+        mode = "120000"
+        content_length = len(target)
+        content_hash = hashlib.sha256(target).hexdigest()
+        digest.update(len(path_bytes).to_bytes(8, "big"))
+        digest.update(path_bytes)
+        digest.update(kind)
+        digest.update(mode.encode("ascii"))
+        digest.update(content_length.to_bytes(8, "big"))
+        digest.update(target)
+    elif stat.S_ISREG(before.st_mode):
+        kind = b"f"
+        mode = "100755" if before.st_mode & 0o111 else "100644"
+        content_length = before.st_size
+        content_hash = hashlib.sha256()
+        digest.update(len(path_bytes).to_bytes(8, "big"))
+        digest.update(path_bytes)
+        digest.update(kind)
+        digest.update(mode.encode("ascii"))
+        digest.update(content_length.to_bytes(8, "big"))
+        descriptor = None
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            with os.fdopen(descriptor, "rb") as source:
+                descriptor = None
+                opened = os.fstat(source.fileno())
+                _ensure(
+                    stat.S_ISREG(opened.st_mode)
+                    and _role_operation_stat_identity(before)
+                    == _role_operation_stat_identity(opened),
+                    "role-operation-baseline-unstable",
+                    "baseline file changed before it was read",
+                )
+                remaining = content_length
+                while remaining:
+                    chunk = source.read(min(1024 * 1024, remaining))
+                    _ensure(
+                        chunk,
+                        "role-operation-baseline-unstable",
+                        "baseline file became shorter while it was read",
+                    )
+                    remaining -= len(chunk)
+                    content_hash.update(chunk)
+                    digest.update(chunk)
+                _ensure(
+                    not source.read(1),
+                    "role-operation-baseline-unstable",
+                    "baseline file became longer while it was read",
+                )
+                after = os.fstat(source.fileno())
+            current = os.lstat(path)
+        except WorkflowError:
+            raise
+        except OSError as error:
+            _raise(
+                "role-operation-baseline-path-unreadable",
+                "unable to read baseline file %r: %s" % (path_bytes, error),
+            )
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        _ensure(
+            _role_operation_stat_identity(before)
+            == _role_operation_stat_identity(after)
+            == _role_operation_stat_identity(current),
+            "role-operation-baseline-unstable",
+            "baseline file changed while it was being read",
+        )
+        content_hash = content_hash.hexdigest()
+    else:
+        _raise(
+            "role-operation-baseline-unsupported-file",
+            "baseline path is not a regular file or symlink: %r" % path_bytes,
+        )
+    return {
+        "path_b64": base64.b64encode(path_bytes).decode("ascii"),
+        "kind": kind.decode("ascii"),
+        "mode": mode,
+        "sha256": content_hash,
+        "byte_length": content_length,
+    }
+
+
+def _role_operation_snapshot_observation(root, config):
+    status = _role_operation_git_output(
+        root,
+        config,
+        "-c",
+        "core.filemode=true",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+    )
+    paths = _role_operation_status_paths(status)
+    digest = hashlib.sha256()
+    digest.update(b"fidenaut-r5-snapshot-v1\0")
+    digest.update(len(status).to_bytes(8, "big"))
+    digest.update(status)
+    digest.update(len(paths).to_bytes(8, "big"))
+    entries = [
+        _role_operation_snapshot_entry(root, path, digest) for path in paths
+    ]
+    return status, entries, digest.hexdigest()
+
+
+def _capture_role_operation_baseline(root, config):
+    root = pathlib.Path(root).resolve()
+    identity, head = _role_operation_repo_identity(root, config)
+    first = _role_operation_snapshot_observation(root, config)
+    second = _role_operation_snapshot_observation(root, config)
+    _ensure(
+        first == second,
+        "role-operation-baseline-unstable",
+        "worktree changed while its admission baseline was captured",
+    )
+    current_identity, current_head = _role_operation_repo_identity(root, config)
+    _ensure(
+        current_identity == identity and current_head == head,
+        "role-operation-baseline-unstable",
+        "repository identity or HEAD changed while its admission baseline was captured",
+    )
+    return {
+        "repo_identity": identity,
+        "repo_head": head,
+        "tree_digest": first[2],
+        "entries": first[1],
+    }
+
+
+def _role_operation_head_entry(root, config, head, path_bytes):
+    path = os.fsdecode(path_bytes)
+    tree_output = _role_operation_git_output(
+        root,
+        config,
+        "--literal-pathspecs",
+        "ls-tree",
+        "-z",
+        "--full-tree",
+        head,
+        "--",
+        path,
+    )
+    if not tree_output:
+        return {
+            "path_b64": base64.b64encode(path_bytes).decode("ascii"),
+            "kind": "x",
+            "mode": None,
+            "sha256": None,
+            "byte_length": 0,
+        }
+    _ensure(
+        tree_output.endswith(b"\0") and tree_output.count(b"\0") == 1,
+        "role-operation-head-object-invalid",
+        "Git returned malformed HEAD tree data for %r" % path_bytes,
+    )
+    metadata, tree_path = tree_output[:-1].split(b"\t", 1)
+    fields = metadata.split(b" ")
+    _ensure(
+        len(fields) == 3
+        and tree_path == path_bytes
+        and fields[0] in (b"100644", b"100755", b"120000")
+        and fields[1] == b"blob"
+        and re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", fields[2]),
+        "role-operation-head-object-unsupported",
+        "HEAD path is not a supported regular-file or symlink blob: %r"
+        % path_bytes,
+    )
+    blob_hash = hashlib.sha256()
+    blob_length = 0
+
+    def consume(chunk):
+        nonlocal blob_length
+        blob_length += len(chunk)
+        blob_hash.update(chunk)
+
+    _run_checked(
+        _git_command(config, "cat-file", "blob", fields[2].decode("ascii")),
+        _effective_limits(config, "git"),
+        root,
+        "role-operation-head-object-read-failed",
+        "unable to read a role-operation HEAD blob",
+        stdout_sink=consume,
+    )
+    return {
+        "path_b64": base64.b64encode(path_bytes).decode("ascii"),
+        "kind": "l" if fields[0] == b"120000" else "f",
+        "mode": fields[0].decode("ascii"),
+        "sha256": blob_hash.hexdigest(),
+        "byte_length": blob_length,
+    }
+
+
+def _role_operation_delta_value(entry):
+    if entry["kind"] == "x":
+        return None
+    return {
+        "kind": entry["kind"],
+        "mode": entry["mode"],
+        "sha256": entry["sha256"],
+        "byte_length": entry["byte_length"],
+    }
+
+
+def _role_operation_validate_delta_scope(delta, state, role):
+    if role == "reviewer":
+        _ensure(
+            not delta,
+            "role-operation-reviewer-mutation",
+            "READ_ONLY reviewer operations must leave the worktree delta empty",
+        )
+    scope = state.get("approved_scope") or []
+    _ensure(
+        isinstance(scope, list)
+        and all(isinstance(path, str) and path for path in scope),
+        "role-operation-scope-drift",
+        "approved role-operation scope is malformed",
+    )
+    for entry in delta:
+        path = os.fsdecode(base64.b64decode(entry["path_b64"], validate=True))
+        _ensure(
+            _path_in_scope(path, scope),
+            "role-operation-scope-drift",
+            "role operation changed a path outside approved scope: %s" % path,
+        )
+        if role in ("test_implementer", "implementer"):
+            _ensure(
+                _is_test_file(path) == (role == "test_implementer"),
+                "role-work-scope-drift",
+                "role operation changed a path assigned to the other implementation role",
+            )
+
+
+def _compute_role_operation_delta(root, config, record, state):
+    baseline = record.get("baseline")
+    _validate_role_operation_baseline(baseline, record.get("op_id", "pending"))
+    role = record.get("request_identity", {}).get("role")
+    _ensure(
+        isinstance(role, str) and role,
+        "role-operation-identity-mismatch",
+        "role-operation delta has no bound role",
+    )
+    root = pathlib.Path(root).resolve()
+    identity, head = _role_operation_repo_identity(root, config)
+    _ensure(
+        identity == baseline["repo_identity"],
+        "role-operation-worktree-mismatch",
+        "acceptance workspace differs from the admitted worktree",
+    )
+    _ensure(
+        head == baseline["repo_head"],
+        "role-operation-head-mismatch",
+        "repository HEAD changed after role-operation admission",
+    )
+    first = _role_operation_snapshot_observation(root, config)
+    baseline_entries = {
+        base64.b64decode(entry["path_b64"], validate=True): entry
+        for entry in baseline["entries"]
+    }
+    current_entries = {
+        base64.b64decode(entry["path_b64"], validate=True): entry
+        for entry in first[1]
+    }
+    deltas = []
+    for path in sorted(set(baseline_entries) | set(current_entries)):
+        head_entry = None
+        if path not in baseline_entries or path not in current_entries:
+            head_entry = _role_operation_head_entry(
+                root, config, head, path
+            )
+        before = baseline_entries.get(path, head_entry)
+        after = current_entries.get(path, head_entry)
+        before_value = _role_operation_delta_value(before)
+        after_value = _role_operation_delta_value(after)
+        if before_value == after_value:
+            continue
+        if before_value is None:
+            change = "added"
+        elif after_value is None:
+            change = "deleted"
+        elif before_value["kind"] != after_value["kind"] or (
+            before_value["kind"] == "l" or after_value["kind"] == "l"
+        ):
+            change = "symlink"
+        elif before_value["mode"] != after_value["mode"]:
+            change = "mode"
+        else:
+            change = "modified"
+        deltas.append(
+            {
+                "path_b64": base64.b64encode(path).decode("ascii"),
+                "change": change,
+                "before": before_value,
+                "after": after_value,
+            }
+        )
+    second = _role_operation_snapshot_observation(root, config)
+    _ensure(
+        first == second,
+        "role-operation-snapshot-unstable",
+        "worktree changed while its acceptance delta was computed",
+    )
+    current_identity, current_head = _role_operation_repo_identity(root, config)
+    _ensure(
+        current_identity == identity and current_head == head,
+        "role-operation-snapshot-unstable",
+        "repository identity or HEAD changed during acceptance snapshot capture",
+    )
+    _role_operation_validate_delta_scope(deltas, state, role)
+    final_identity, final_head = _role_operation_repo_identity(root, config)
+    _ensure(
+        final_identity == identity and final_head == head,
+        "role-operation-snapshot-unstable",
+        "repository identity or HEAD changed while the accepted delta was computed",
+    )
+    return deltas
+
+
+def _role_operation_output_directory(run_root, relative_path, op_id):
+    run_root = pathlib.Path(run_root).resolve()
+    operation_directory = run_root / "ops" / op_id
+    for directory in (run_root, run_root / "ops", operation_directory):
+        try:
+            metadata = os.lstat(directory)
+        except FileNotFoundError:
+            _raise(
+                "role-operation-evidence-missing",
+                "operation-scoped output directory is missing",
+            )
+        except OSError as error:
+            _raise(
+                "role-operation-evidence-path-invalid",
+                "unable to inspect operation-scoped output directory: %s" % error,
+            )
+        _ensure(
+            stat.S_ISDIR(metadata.st_mode),
+            "role-operation-evidence-path-invalid",
+            "operation-scoped output directory is not a real directory",
+        )
+    output = run_root / pathlib.PurePosixPath(relative_path)
+    try:
+        canonical = output.resolve(strict=False)
+        canonical.relative_to(run_root)
+    except (OSError, RuntimeError, ValueError) as error:
+        _raise(
+            "role-operation-evidence-path-invalid",
+            "operation-scoped output path escapes its run root: %s" % error,
+        )
+    _ensure(
+        canonical == output,
+        "role-operation-evidence-path-invalid",
+        "operation-scoped output path resolves through a symlink",
+    )
+    return output
+
+
+def _role_operation_read_output_once(path):
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        _raise(
+            "role-operation-evidence-missing",
+            "required operation-scoped output is missing",
+        )
+    except OSError as error:
+        _raise(
+            "role-operation-evidence-unreadable",
+            "unable to inspect operation-scoped output: %s" % error,
+        )
+    _ensure(
+        stat.S_ISREG(before.st_mode),
+        "role-operation-evidence-path-invalid",
+        "operation-scoped output must be a regular non-symlink file",
+    )
+    digest = hashlib.sha256()
+    byte_length = 0
+    descriptor = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = None
+            opened = os.fstat(source.fileno())
+            _ensure(
+                stat.S_ISREG(opened.st_mode)
+                and _role_operation_stat_identity(before)
+                == _role_operation_stat_identity(opened),
+                "role-operation-evidence-unstable",
+                "operation-scoped output changed before it was read",
+            )
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                byte_length += len(chunk)
+                digest.update(chunk)
+            after = os.fstat(source.fileno())
+        current = os.lstat(path)
+    except WorkflowError:
+        raise
+    except FileNotFoundError:
+        _raise(
+            "role-operation-evidence-missing",
+            "required operation-scoped output disappeared while it was read",
+        )
+    except OSError as error:
+        _raise(
+            "role-operation-evidence-unreadable",
+            "unable to read operation-scoped output: %s" % error,
+        )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    _ensure(
+        _role_operation_stat_identity(before)
+        == _role_operation_stat_identity(after)
+        == _role_operation_stat_identity(current),
+        "role-operation-evidence-unstable",
+        "operation-scoped output changed while it was read",
+    )
+    return digest.hexdigest(), byte_length, _role_operation_stat_identity(after)
+
+
+def _verify_role_operation_evidence(root, config, issue, record):
+    stage = ROLE_WORK_STAGES.get(record.get("gate"))
+    identity = record.get("request_identity")
+    _ensure(
+        stage is not None
+        and record.get("role") == stage[0]
+        and isinstance(identity, dict)
+        and identity.get("issue") == issue
+        and identity.get("gate") == record.get("gate")
+        and identity.get("role") == record.get("role"),
+        "role-operation-role-mismatch",
+        "operation output is not bound to the admitted role and gate",
+    )
+    expected_path = _role_operation_output_relative_path(record)
+    _ensure(
+        record.get("output_path") == expected_path,
+        "role-operation-output-path-invalid",
+        "operation output path does not match its Fidenaut G-record binding",
+    )
+    run_root = _run_root(root, config, issue)
+    output = _role_operation_output_directory(
+        run_root, expected_path, record["op_id"]
+    )
+    first = _role_operation_read_output_once(output)
+    second = _role_operation_read_output_once(output)
+    _ensure(
+        first == second,
+        "role-operation-evidence-unstable",
+        "operation-scoped output changed between verification reads",
+    )
+    return {
+        "path": expected_path,
+        "sha256": first[0],
+        "byte_length": first[1],
+    }
 
 
 def _admit_role_operation(root, config, issue, request_identity):
@@ -1489,6 +2346,7 @@ def _admit_role_operation(root, config, issue, request_identity):
                 "duplicate-role-operation-id",
                 "Fidenaut generated a role operation ID already used by another run",
             )
+            baseline = _capture_role_operation_baseline(root, config)
             next_revision = state.get("_state_revision", 0) + 1
             record = {
                 "format": ROLE_OPERATION_FORMAT,
@@ -1503,6 +2361,13 @@ def _admit_role_operation(root, config, issue, request_identity):
                 "delivery_attempt": 1,
                 "status": "reserved",
                 "prior_op": prior_op,
+                "baseline": baseline,
+                "output_path": _role_operation_output_relative_path(
+                    {
+                        "op_id": op_id,
+                        "gate": state["status"],
+                    }
+                ),
                 "result": None,
                 "failure_reason": None,
             }
@@ -1534,9 +2399,12 @@ def _apply_verified_role_operation_transition(
             "governance transition does not match the persisted operation",
         )
         if record["status"] in TERMINAL_ROLE_OPERATION_STATUSES:
+            replay_result = record.get("result")
+            if record["status"] == "succeeded" and isinstance(replay_result, dict):
+                replay_result = replay_result.get("executor_result")
             _ensure(
                 transition.to_status == record["status"]
-                and transition.result == record.get("result")
+                and transition.result == replay_result
                 and transition.failure_reason == record.get("failure_reason")
                 and transition.from_status in ("dispatched", "unknown")
                 and transition.expected_state_revision
@@ -1585,8 +2453,28 @@ def _apply_verified_role_operation_transition(
                 "invalid-role-operation-transition",
                 "successful governance transition requires a result object",
             )
+            _ensure(
+                isinstance(record.get("baseline"), dict)
+                and isinstance(record.get("output_path"), str),
+                "role-operation-r5-baseline-missing",
+                "pre-R5 role operations cannot be accepted without their admission baseline",
+            )
             _validate_role_operation_json(
                 transition.result, "verified role-operation result"
+            )
+            accepted_delta = _compute_role_operation_delta(
+                root, config, record, state
+            )
+            accepted_artifact = _verify_role_operation_evidence(
+                root, config, issue, record
+            )
+            persisted_result = {
+                "executor_result": json.loads(json.dumps(transition.result)),
+                "accepted_artifact": accepted_artifact,
+                "accepted_delta": accepted_delta,
+            }
+            _validate_role_operation_json(
+                persisted_result, "Fidenaut-verified role-operation result"
             )
         elif transition.to_status == "failed":
             _ensure(
@@ -1606,7 +2494,9 @@ def _apply_verified_role_operation_transition(
             return json.loads(json.dumps(record))
         record["status"] = transition.to_status
         record["result"] = (
-            json.loads(json.dumps(transition.result))
+            persisted_result
+            if transition.to_status == "succeeded"
+            else json.loads(json.dumps(transition.result))
             if transition.result is not None
             else None
         )
@@ -2148,17 +3038,19 @@ def _decode_output(result, stream):
     return raw.decode("utf-8", errors="replace")
 
 
-def _run_bounded(command, limits, cwd, env=None):
+def _run_bounded(command, limits, cwd, env=None, stdout_sink=None):
     """Run a command through the process supervisor and decode retained output."""
-    result = workflow_supervisor.supervise(
-        command,
-        timeout_ms=limits["timeout_ms"],
-        grace_ms=limits["grace_ms"],
-        output_limit_bytes=limits["output_limit_bytes"],
-        stderr_limit_bytes=limits.get("stderr_limit_bytes"),
-        cwd=str(cwd),
-        env=env,
-    )
+    options = {
+        "timeout_ms": limits["timeout_ms"],
+        "grace_ms": limits["grace_ms"],
+        "output_limit_bytes": limits["output_limit_bytes"],
+        "stderr_limit_bytes": limits.get("stderr_limit_bytes"),
+        "cwd": str(cwd),
+        "env": env,
+    }
+    if stdout_sink is not None:
+        options["stdout_sink"] = stdout_sink
+    result = workflow_supervisor.supervise(command, **options)
     return {
         "command": command,
         "result": result,
@@ -2167,9 +3059,14 @@ def _run_bounded(command, limits, cwd, env=None):
     }
 
 
-def _run_checked(command, limits, cwd, code, context, env=None):
+def _run_checked(command, limits, cwd, code, context, env=None, stdout_sink=None):
     """Run a bounded command and raise a workflow error unless it succeeds."""
-    completed = _run_bounded(command, limits, cwd, env=env)
+    if stdout_sink is None:
+        completed = _run_bounded(command, limits, cwd, env=env)
+    else:
+        completed = _run_bounded(
+            command, limits, cwd, env=env, stdout_sink=stdout_sink
+        )
     result = completed["result"]
     ok = result.get("outcome") == "success" and result.get("exit_code") == 0
     if not ok:
