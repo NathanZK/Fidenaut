@@ -49,8 +49,9 @@ keeps managed role execution disabled.
 
 The selected mode is immutable for a run. Mode-sensitive commands reject a
 configuration/run mismatch before invoking a runtime. `executor-v1` is a
-governance mode selection only; this release does not include an executor or
-provider integration.
+governance mode selection only. The repository includes a file-backed
+protocol fake for tests, but it is not wired into workflow commands and does
+not provide a production executor or provider integration.
 
 ## Provider quickstart
 
@@ -186,3 +187,5 @@ to make publication pass.
   maintainer-oriented contracts and invariants.
 - [`docs/specs/role-operation-records.md`](docs/specs/role-operation-records.md):
   pinned role-execution modes and governance-owned operation records.
+- [`docs/specs/executor-protocol.md`](docs/specs/executor-protocol.md):
+  the provider-neutral executor boundary and file-backed protocol fake.
