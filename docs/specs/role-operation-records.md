@@ -54,4 +54,14 @@
 - State writes use atomic replacement and compare-and-swap against the currently persisted revision. Concurrent stale writers fail closed without partial state changes.
 - CAS prevents a stale in-flight snapshot from overwriting a newer persisted revision. It does not detect an out-of-band restoration of an older valid `state.json`; this limitation is intentional because the protocol has no rollback watermark or revision journal.
 - A reserved operation can be replayed idempotently after process restart before delivery; a dispatched operation can be accepted after restart only after persisted identity and revision checks pass.
-- These primitives do not implement executor dispatch, evidence acceptance, R5 baseline/delta, retries, or provider lifecycle.
+
+## R5 baseline, delta, and accepted evidence
+
+- R5 inspects only the operation-bound, Fidenaut-created Git worktree on the same host. It does not create worktrees or support arbitrary external or cross-host worktrees.
+- Admission stores the canonical worktree root, worktree Git directory, common Git directory, `HEAD`, a framed snapshot digest, and a sorted path manifest in the G-record baseline. Git status is captured with `-c core.filemode=true status --porcelain=v2 -z --untracked-files=all`; the exact status bytes are included in snapshot verification.
+- Ignored untracked paths are excluded from the baseline and accepted delta because the pinned status command omits them. A tracked file remains included when changed even if it matches an ignore rule. An ignored untracked path alone is not an accepted change.
+- Acceptance revalidates worktree identity and `HEAD`, captures a stable final snapshot, and computes a deterministic path delta against admission state and the unchanged HEAD tree. Delta paths are checked against the run's approved scope and role-specific test/implementation path split. Renames are represented as deletion plus addition; reviewers configured `READ_ONLY` require an empty delta.
+- The G-record's Fidenaut-derived `output_path` is `ops/<op_id>/<kind>` relative to the run root. Successful `result` stores `{executor_result, accepted_artifact, accepted_delta}`; executor claims are informational. `accepted_artifact` records the operation-relative path, Fidenaut-computed lowercase SHA-256, and byte length. The output is read twice and must remain a regular, stable file in the operation-scoped directory.
+- Invalid or unstable Git snapshots, changed identity/HEAD/revision, out-of-scope changes, missing or unreadable output, path escape, role mismatch, or differing output reads fail closed before success is persisted. Persistence failures leave prior state intact; retries recapture and reverify evidence. Existing locks, G9, CAS revision checks, and terminal replay rules remain in force.
+- Pre-R5 records without a baseline remain readable as persisted history. An open pre-R5 operation cannot transition to `succeeded`, because its admission baseline cannot be reconstructed after the fact.
+- These primitives do not implement executor dispatch, external provider lifecycle, or worktree creation.

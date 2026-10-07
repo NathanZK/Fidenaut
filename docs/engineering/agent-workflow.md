@@ -50,6 +50,15 @@ New runs persist a Fidenaut-generated `run_id` and immutable
 conflicts with explicit `executor-v1`. Governance-owned role-operation
 records, admission, and acceptance invariants are documented in
 [`role-operation-records.md`](../specs/role-operation-records.md).
+R5 acceptance evidence is computed against the operation-bound, Fidenaut-created
+same-host worktree. It captures `HEAD`, repository identity, status bytes from
+`git status --porcelain=v2 -z --untracked-files=all`, and a framed baseline
+before reservation, then recomputes a stable path delta and verifies the
+Fidenaut-derived operation-scoped output before success. Ignored untracked
+paths are excluded because the status command omits them; tracked changes
+remain included even when matching ignore rules. Executor-provided paths or
+hashes are not authoritative, and verification or persistence failures leave
+the operation unaccepted.
 
 ### External provider runtime boundary
 

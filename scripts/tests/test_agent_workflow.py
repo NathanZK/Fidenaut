@@ -3574,6 +3574,30 @@ class AgentWorkflowTest(unittest.TestCase):
             self.root, config, issue, transition
         )
 
+    def dispatched_role_operation(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        admitted = self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        return self.apply_role_operation_transition(
+            ISSUE,
+            self.verified_role_operation_transition(admitted, "dispatched"),
+        )
+
+    def role_operation_output(self, record, issue=ISSUE):
+        run_root = workflow._run_root(
+            self.root, workflow._load_config(self.root), issue
+        )
+        return run_root / record["output_path"]
+
+    def write_role_operation_output(
+        self, record, data=b"verified output", issue=ISSUE
+    ):
+        path = self.role_operation_output(record, issue=issue)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
     def state_for_issue(self, issue):
         path = (
             self.root
@@ -3611,6 +3635,443 @@ class AgentWorkflowTest(unittest.TestCase):
             replayed,
         )
         self.assertEqual(state_after_admission, self.state())
+
+    def test_role_operation_admission_captures_deterministic_r5_baseline(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        (self.root / ".gitignore").write_text(
+            "artifacts-src/\n.agent-workflow/\ngenerated/\n"
+            "should-not-run.marker\nignored-untracked.txt\n",
+            encoding="utf-8",
+        )
+        (self.root / ".gitignore").chmod(0o755)
+        (self.root / "staged.txt").write_bytes(b"staged bytes")
+        self.git("add", "staged.txt")
+        (self.root / "deleted.txt").write_bytes(b"delete me")
+        self.git("add", "deleted.txt")
+        self.git("commit", "-qm", "add staged and deleted paths")
+        (self.root / "staged.txt").write_bytes(b"staged bytes changed")
+        (self.root / "untracked.txt").write_bytes(b"untracked bytes")
+        (self.root / "ignored-untracked.txt").write_bytes(b"ignored bytes")
+        (self.root / "deleted.txt").unlink()
+        (self.root / "link.txt").symlink_to("untracked.txt")
+
+        identity = self.role_operation_identity(self.state())
+        admitted = self.admit_role_operation(ISSUE, identity)
+        baseline = admitted.get("baseline")
+
+        self.assertIsInstance(baseline, dict)
+        self.assertEqual(
+            str(self.root.resolve()),
+            baseline["repo_identity"]["worktree_root"],
+        )
+        self.assertEqual(
+            self.git("rev-parse", "HEAD").stdout.strip(),
+            baseline["repo_head"],
+        )
+        self.assertEqual(
+            str((self.root / ".git").resolve()),
+            baseline["repo_identity"]["git_dir"],
+        )
+        self.assertEqual(
+            str((self.root / ".git").resolve()),
+            baseline["repo_identity"]["common_git_dir"],
+        )
+        status = self.git(
+            "-c", "core.filemode=true", "status", "--porcelain=v2", "-z",
+            "--untracked-files=all",
+        ).stdout.encode()
+        status_records = status.split(b"\0")
+        gitignore_status = next(
+            record for record in status_records if record.endswith(b" .gitignore")
+        )
+        self.assertEqual(b"100755", gitignore_status.split(b" ", 8)[5])
+        self.assertNotIn(b"ignored-untracked.txt", status)
+
+        entries = {base64.b64decode(item["path_b64"]): item for item in baseline["entries"]}
+        self.assertEqual(
+            sorted(base64.b64decode(item["path_b64"]) for item in baseline["entries"]),
+            [base64.b64decode(item["path_b64"]) for item in baseline["entries"]],
+        )
+        self.assertEqual(
+            {
+                b".gitignore",
+                b"deleted.txt",
+                b"link.txt",
+                b"staged.txt",
+                b"untracked.txt",
+            },
+            set(entries),
+        )
+        self.assertNotIn(b"ignored-untracked.txt", entries)
+        self.assertEqual("100755", entries[b".gitignore"]["mode"])
+        self.assertEqual("l", entries[b"link.txt"]["kind"])
+        self.assertEqual("x", entries[b"deleted.txt"]["kind"])
+        self.assertEqual(len(b"untracked bytes"), entries[b"untracked.txt"]["byte_length"])
+        self.assertEqual(
+            hashlib.sha256(b"untracked bytes").hexdigest(),
+            entries[b"untracked.txt"]["sha256"],
+        )
+
+        digest = hashlib.sha256()
+        digest.update(b"fidenaut-r5-snapshot-v1\0")
+        digest.update(len(status).to_bytes(8, "big"))
+        digest.update(status)
+        digest.update(len(baseline["entries"]).to_bytes(8, "big"))
+        for item in baseline["entries"]:
+            path = base64.b64decode(item["path_b64"], validate=True)
+            digest.update(len(path).to_bytes(8, "big"))
+            digest.update(path)
+            digest.update(item["kind"].encode("ascii"))
+            digest.update((item["mode"] or "000000").encode("ascii"))
+            data = (
+                (self.root / os.fsdecode(path)).read_bytes()
+                if item["kind"] == "f"
+                else os.readlink(self.root / os.fsdecode(path)).encode()
+                if item["kind"] == "l"
+                else b""
+            )
+            digest.update(len(data).to_bytes(8, "big"))
+            digest.update(data)
+        self.assertEqual(digest.hexdigest(), baseline["tree_digest"])
+
+    def test_role_operation_admission_fails_closed_on_malformed_baseline_status(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        identity = self.role_operation_identity(self.state())
+        original = workflow._role_operation_git_output
+
+        def malformed_status(root, config, *arguments):
+            if "status" in arguments:
+                return b"unsupported record\0"
+            return original(root, config, *arguments)
+
+        with mock.patch.object(
+            workflow,
+            "_role_operation_git_output",
+            side_effect=malformed_status,
+        ):
+            with self.assertRaises(workflow.WorkflowError) as raised:
+                self.admit_role_operation(ISSUE, identity)
+
+        self.assertEqual("role-operation-baseline-invalid", raised.exception.code)
+        self.assertNotIn("role_ops", self.state())
+
+    def test_role_operation_status_parser_includes_both_rename_paths(self):
+        status = (
+            b"2 R. N... 100644 100644 100644 "
+            + b"a" * 40
+            + b" "
+            + b"b" * 40
+            + b" R100 renamed.txt\0original.txt\0"
+        )
+
+        self.assertEqual(
+            [b"original.txt", b"renamed.txt"],
+            workflow._role_operation_status_paths(status),
+        )
+
+    def test_role_operation_admission_fails_closed_on_unreadable_baseline_path(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        unreadable = self.root / "unreadable.txt"
+        unreadable.write_bytes(b"cannot read")
+        identity = self.role_operation_identity(self.state())
+        original_open = os.open
+
+        def fail_unreadable_path(path, flags, *arguments, **keywords):
+            if (
+                isinstance(path, (str, os.PathLike))
+                and pathlib.Path(path).resolve() == unreadable.resolve()
+            ):
+                raise PermissionError("injected unreadable baseline path")
+            return original_open(path, flags, *arguments, **keywords)
+
+        with mock.patch.object(os, "open", side_effect=fail_unreadable_path):
+            with self.assertRaises(workflow.WorkflowError) as raised:
+                self.admit_role_operation(ISSUE, identity)
+
+        self.assertEqual(
+            "role-operation-baseline-path-unreadable",
+            raised.exception.code,
+        )
+        self.assertNotIn("role_ops", self.state())
+
+    def test_role_operation_delta_excludes_ignored_untracked_but_includes_tracked(
+        self,
+    ):
+        gitignore = self.root / ".gitignore"
+        gitignore.write_text(
+            gitignore.read_text(encoding="utf-8") + "ignored-*.txt\n",
+            encoding="utf-8",
+        )
+        tracked_ignored = self.root / "ignored-tracked.txt"
+        tracked_ignored.write_bytes(b"tracked before")
+        self.git("add", ".gitignore")
+        self.git("add", "-f", "ignored-tracked.txt")
+        self.git("commit", "-qm", "add ignored tracked path")
+        baseline = self.r5_baseline()
+
+        ignored_untracked = self.root / "ignored-untracked.txt"
+        ignored_untracked.write_bytes(b"ignored")
+
+        ignored_delta = self.role_operation_delta(
+            baseline, role="implementer", scope=["ignored-tracked.txt"]
+        )
+        self.assertEqual([], ignored_delta)
+
+        tracked_ignored.write_bytes(b"tracked after")
+
+        delta = self.role_operation_delta(
+            baseline, role="implementer", scope=["ignored-tracked.txt"]
+        )
+
+        self.assertEqual(
+            [encoded("ignored-tracked.txt")],
+            [entry["path_b64"] for entry in delta],
+        )
+        self.assertEqual("modified", delta[0]["change"])
+
+    def r5_baseline(self):
+        config = workflow._load_config(self.root)
+        return workflow._capture_role_operation_baseline(self.root, config)
+
+    def role_operation_delta(self, baseline, role="implementer", scope=None):
+        return workflow._compute_role_operation_delta(
+            self.root,
+            workflow._load_config(self.root),
+            {
+                "baseline": baseline,
+                "request_identity": {"role": role},
+            },
+            {"approved_scope": ["src"] if scope is None else scope},
+        )
+
+    def test_role_operation_delta_classifies_changes_in_raw_path_order(self):
+        source = self.root / "src"
+        source.mkdir()
+        modified_path = source / "modified *:é.txt"
+        modified_path.write_bytes(b"before")
+        (source / "deleted.txt").write_bytes(b"delete")
+        (source / "mode.txt").write_bytes(b"mode")
+        (source / "type.txt").write_bytes(b"type")
+        self.git("add", "src")
+        self.git("commit", "-qm", "add scoped baseline files")
+        baseline = self.r5_baseline()
+
+        (source / "added.txt").write_bytes(b"added")
+        modified_path.write_bytes(b"after")
+        (source / "deleted.txt").unlink()
+        (source / "mode.txt").chmod(0o755)
+        (source / "type.txt").unlink()
+        (source / "type.txt").symlink_to("modified.txt")
+
+        delta = self.role_operation_delta(baseline)
+
+        self.assertEqual(
+            [
+                "added",
+                "deleted",
+                "mode",
+                "modified",
+                "symlink",
+            ],
+            [item["change"] for item in delta],
+        )
+        self.assertEqual(
+            [
+                encoded("src/added.txt"),
+                encoded("src/deleted.txt"),
+                encoded("src/mode.txt"),
+                encoded("src/modified *:é.txt"),
+                encoded("src/type.txt"),
+            ],
+            [item["path_b64"] for item in delta],
+        )
+        for item in delta:
+            self.assertEqual(
+                {"path_b64", "change", "before", "after"},
+                set(item),
+            )
+            for value in (item["before"], item["after"]):
+                if value is not None:
+                    self.assertEqual(
+                        {"kind", "mode", "sha256", "byte_length"},
+                        set(value),
+                    )
+        self.assertIsNone(delta[0]["before"])
+        self.assertEqual(
+            {
+                "kind": "f",
+                "mode": "100644",
+                "sha256": hashlib.sha256(b"added").hexdigest(),
+                "byte_length": len(b"added"),
+            },
+            delta[0]["after"],
+        )
+        self.assertEqual("f", delta[1]["before"]["kind"])
+        self.assertIsNone(delta[1]["after"])
+        self.assertEqual("100644", delta[2]["before"]["mode"])
+        self.assertEqual("100755", delta[2]["after"]["mode"])
+        self.assertEqual(
+            hashlib.sha256(b"before").hexdigest(),
+            delta[3]["before"]["sha256"],
+        )
+        self.assertEqual("l", delta[4]["after"]["kind"])
+
+    def test_role_operation_delta_treats_rename_as_delete_and_add(self):
+        source = self.root / "src"
+        source.mkdir()
+        (source / "original.txt").write_bytes(b"rename")
+        (source / "same.txt").write_bytes(b"same")
+        (source / "recreated.txt").write_bytes(b"before")
+        self.git("add", "src")
+        self.git("commit", "-qm", "add rename baseline files")
+        baseline = self.r5_baseline()
+
+        self.git("mv", "src/original.txt", "src/renamed.txt")
+        (source / "same.txt").unlink()
+        (source / "same.txt").write_bytes(b"same")
+        (source / "recreated.txt").unlink()
+        (source / "recreated.txt").write_bytes(b"after")
+
+        delta = self.role_operation_delta(baseline)
+
+        self.assertEqual(
+            ["deleted", "modified", "added"],
+            [item["change"] for item in delta],
+        )
+        self.assertEqual(
+            [
+                encoded("src/original.txt"),
+                encoded("src/recreated.txt"),
+                encoded("src/renamed.txt"),
+            ],
+            [item["path_b64"] for item in delta],
+        )
+        self.assertEqual(
+            hashlib.sha256(b"before").hexdigest(),
+            delta[1]["before"]["sha256"],
+        )
+        self.assertEqual(
+            hashlib.sha256(b"after").hexdigest(),
+            delta[1]["after"]["sha256"],
+        )
+
+    def test_role_operation_delta_streams_large_head_blob(self):
+        source = self.root / "src"
+        source.mkdir()
+        path = source / "large.bin"
+        path.write_bytes(b"a" * 700_000)
+        self.git("add", "src")
+        self.git("commit", "-qm", "add large baseline blob")
+        baseline = self.r5_baseline()
+        path.write_bytes(b"b" * 800_000)
+
+        delta = self.role_operation_delta(baseline)
+
+        self.assertEqual(1, len(delta))
+        self.assertEqual("modified", delta[0]["change"])
+        self.assertEqual(700_000, delta[0]["before"]["byte_length"])
+        self.assertEqual(
+            hashlib.sha256(b"a" * 700_000).hexdigest(),
+            delta[0]["before"]["sha256"],
+        )
+        self.assertEqual(800_000, delta[0]["after"]["byte_length"])
+
+    def test_role_operation_delta_detects_symlink_target_change(self):
+        source = self.root / "src"
+        source.mkdir()
+        link = source / "link"
+        link.symlink_to("first-target")
+        self.git("add", "src")
+        self.git("commit", "-qm", "add symlink baseline")
+        baseline = self.r5_baseline()
+        link.unlink()
+        link.symlink_to("second-target")
+
+        delta = self.role_operation_delta(baseline)
+
+        self.assertEqual(1, len(delta))
+        self.assertEqual("symlink", delta[0]["change"])
+        self.assertEqual(
+            hashlib.sha256(b"first-target").hexdigest(),
+            delta[0]["before"]["sha256"],
+        )
+        self.assertEqual(
+            hashlib.sha256(b"second-target").hexdigest(),
+            delta[0]["after"]["sha256"],
+        )
+
+    def test_role_operation_delta_rejects_out_of_scope_and_reviewer_changes(self):
+        source = self.root / "src"
+        source.mkdir()
+        (source / "file.txt").write_bytes(b"before")
+        self.git("add", "src")
+        self.git("commit", "-qm", "add delta scope baseline")
+        baseline = self.r5_baseline()
+        (source / "file.txt").write_bytes(b"after")
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.role_operation_delta(baseline, scope=["docs"])
+        self.assertEqual("role-operation-scope-drift", raised.exception.code)
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.role_operation_delta(baseline, role="reviewer")
+        self.assertEqual(
+            "role-operation-reviewer-mutation",
+            raised.exception.code,
+        )
+
+    def test_role_operation_delta_enforces_test_implementer_path_split(self):
+        source = self.root / "src"
+        source.mkdir()
+        (source / "file.txt").write_bytes(b"before")
+        self.git("add", "src")
+        self.git("commit", "-qm", "add role-split baseline")
+        baseline = self.r5_baseline()
+        (source / "file.txt").write_bytes(b"after")
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.role_operation_delta(
+                baseline,
+                role="test_implementer",
+                scope=["src"],
+            )
+
+        self.assertEqual("role-work-scope-drift", raised.exception.code)
+
+    def test_role_operation_delta_rejects_changed_head_and_another_worktree(self):
+        source = self.root / "src"
+        source.mkdir()
+        (source / "file.txt").write_bytes(b"before")
+        self.git("add", "src")
+        self.git("commit", "-qm", "add operation-bound baseline")
+        baseline = self.r5_baseline()
+        (source / "file.txt").write_bytes(b"after")
+        self.git("add", "src/file.txt")
+        self.git("commit", "-qm", "advance head")
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.role_operation_delta(baseline)
+        self.assertEqual("role-operation-head-mismatch", raised.exception.code)
+
+        worktree = self.root.parent / "other-worktree"
+        self.git("worktree", "add", "-q", str(worktree), "HEAD")
+        try:
+            with self.assertRaises(workflow.WorkflowError) as raised:
+                workflow._compute_role_operation_delta(
+                    worktree,
+                    workflow._load_config(worktree),
+                    {
+                        "baseline": baseline,
+                        "request_identity": {"role": "implementer"},
+                    },
+                    {"approved_scope": ["src"]},
+                )
+            self.assertEqual(
+                "role-operation-worktree-mismatch",
+                raised.exception.code,
+            )
+        finally:
+            self.git("worktree", "remove", "-f", str(worktree))
 
     def test_role_operation_record_rejects_changed_request_under_existing_id(self):
         self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
@@ -3733,6 +4194,16 @@ class AgentWorkflowTest(unittest.TestCase):
         ]
         barrier = threading.Barrier(2)
         results = []
+        baseline = {
+            "repo_identity": {
+                "worktree_root": str(self.root.resolve()),
+                "git_dir": str((self.root / ".git").resolve()),
+                "common_git_dir": str((self.root / ".git").resolve()),
+            },
+            "repo_head": self.git("rev-parse", "HEAD").stdout.strip(),
+            "tree_digest": "0" * 64,
+            "entries": [],
+        }
 
         def admit(identity):
             barrier.wait()
@@ -3745,10 +4216,15 @@ class AgentWorkflowTest(unittest.TestCase):
             threading.Thread(target=admit, args=(identity,))
             for identity in identities
         ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=5)
+        with mock.patch.object(
+            workflow,
+            "_capture_role_operation_baseline",
+            return_value=baseline,
+        ):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
 
         self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual(1, sum(isinstance(result, dict) for result in results))
@@ -3848,6 +4324,7 @@ class AgentWorkflowTest(unittest.TestCase):
         dispatched = self.apply_role_operation_transition(
             ISSUE, self.verified_role_operation_transition(admitted, "dispatched")
         )
+        self.write_role_operation_output(dispatched)
         accepted = self.apply_role_operation_transition(
             ISSUE,
             self.verified_role_operation_transition(
@@ -3856,7 +4333,11 @@ class AgentWorkflowTest(unittest.TestCase):
         )
 
         self.assertEqual("succeeded", accepted["status"])
-        self.assertEqual({"verified": True}, accepted["result"])
+        self.assertEqual(
+            hashlib.sha256(b"verified output").hexdigest(),
+            accepted["result"]["accepted_artifact"]["sha256"],
+        )
+        self.assertEqual([], accepted["result"]["accepted_delta"])
         self.assertEqual(
             accepted["state_revision"], self.state()["_state_revision"]
         )
@@ -3894,6 +4375,8 @@ class AgentWorkflowTest(unittest.TestCase):
                         "verified failure" if to_status == "failed" else None
                     ),
                 )
+                if to_status == "succeeded":
+                    self.write_role_operation_output(record, issue=issue)
 
                 updated = self.apply_role_operation_transition(issue, transition)
 
@@ -3930,6 +4413,164 @@ class AgentWorkflowTest(unittest.TestCase):
             "dispatched",
             self.state()["role_ops"][admitted["op_id"]]["status"],
         )
+
+    def test_pre_r5_terminal_role_operation_remains_readable(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        admitted = self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        dispatched = self.apply_role_operation_transition(
+            ISSUE, self.verified_role_operation_transition(admitted, "dispatched")
+        )
+        state = self.state()
+        record = state["role_ops"][dispatched["op_id"]]
+        record.pop("baseline")
+        record.pop("output_path")
+        record["status"] = "succeeded"
+        record["result"] = {"verified": True}
+        self.write_state(state)
+
+        loaded = workflow._read_state(
+            self.root, workflow._load_config(self.root), ISSUE
+        )
+
+        self.assertEqual(
+            {"verified": True},
+            loaded["role_ops"][dispatched["op_id"]]["result"],
+        )
+
+    def test_pre_r5_open_role_operation_cannot_be_accepted(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        admitted = self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        dispatched = self.apply_role_operation_transition(
+            ISSUE, self.verified_role_operation_transition(admitted, "dispatched")
+        )
+        transition = self.verified_role_operation_transition(
+            dispatched, "succeeded", result={"verified": True}
+        )
+        state = self.state()
+        record = state["role_ops"][dispatched["op_id"]]
+        record.pop("baseline")
+        record.pop("output_path")
+        self.write_state(state)
+        before = workflow._state_path(
+            self.root, workflow._load_config(self.root), ISSUE
+        ).read_bytes()
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.apply_role_operation_transition(ISSUE, transition)
+
+        self.assertEqual(
+            "role-operation-r5-baseline-missing", raised.exception.code
+        )
+        self.assertEqual(
+            before,
+            workflow._state_path(
+                self.root, workflow._load_config(self.root), ISSUE
+            ).read_bytes(),
+        )
+
+    def test_role_operation_acceptance_write_failure_preserves_state_and_reverifies(
+        self,
+    ):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        admitted = self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        dispatched = self.apply_role_operation_transition(
+            ISSUE, self.verified_role_operation_transition(admitted, "dispatched")
+        )
+        self.write_role_operation_output(dispatched, data=b"first output")
+        transition = self.verified_role_operation_transition(
+            dispatched, "succeeded", result={"verified": True}
+        )
+        config = workflow._load_config(self.root)
+        state_path = workflow._state_path(self.root, config, ISSUE)
+        before = state_path.read_bytes()
+        original_replace = workflow.os.replace
+
+        def fail_state_replace(source, destination):
+            if pathlib.Path(destination) == state_path:
+                raise OSError("injected state replacement failure")
+            return original_replace(source, destination)
+
+        with mock.patch.object(
+            workflow.os, "replace", side_effect=fail_state_replace
+        ):
+            with self.assertRaises(workflow.WorkflowError) as raised:
+                self.apply_role_operation_transition(ISSUE, transition)
+
+        self.assertEqual("persistence-failed", raised.exception.code)
+        self.assertEqual(before, state_path.read_bytes())
+        self.assertEqual(
+            "dispatched",
+            self.state()["role_ops"][admitted["op_id"]]["status"],
+        )
+
+        output_path = self.role_operation_output(dispatched)
+        output_path.write_bytes(b"retry output")
+        original_read = workflow._role_operation_read_output_once
+        reads = []
+
+        def observe_read(path):
+            reads.append(path)
+            return original_read(path)
+
+        with mock.patch.object(
+            workflow, "_role_operation_read_output_once", side_effect=observe_read
+        ):
+            accepted = self.apply_role_operation_transition(ISSUE, transition)
+
+        self.assertEqual(2, len(reads))
+        self.assertEqual("succeeded", accepted["status"])
+        self.assertEqual(
+            hashlib.sha256(b"retry output").hexdigest(),
+            accepted["result"]["accepted_artifact"]["sha256"],
+        )
+        persisted = self.state()
+        self.assertEqual(accepted, persisted["role_ops"][admitted["op_id"]])
+        workflow._validate_role_operation_records(persisted)
+
+    def test_concurrent_role_operation_acceptance_is_single_terminal_write(self):
+        self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
+        admitted = self.admit_role_operation(
+            ISSUE, self.role_operation_identity(self.state())
+        )
+        dispatched = self.apply_role_operation_transition(
+            ISSUE, self.verified_role_operation_transition(admitted, "dispatched")
+        )
+        self.write_role_operation_output(dispatched)
+        transition = self.verified_role_operation_transition(
+            dispatched, "succeeded", result={"verified": True}
+        )
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def accept():
+            try:
+                barrier.wait(timeout=5)
+                results.append(self.apply_role_operation_transition(ISSUE, transition))
+            except Exception as error:
+                errors.append(error)
+
+        with mock.patch.object(workflow, "_compute_role_operation_delta", return_value=[]):
+            workers = [threading.Thread(target=accept) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=10)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual([], errors)
+        self.assertEqual(2, len(results))
+        self.assertEqual(results[0], results[1])
+        persisted = self.state()
+        self.assertEqual(results[0], persisted["role_ops"][admitted["op_id"]])
+        self.assertEqual("succeeded", persisted["role_ops"][admitted["op_id"]]["status"])
+        workflow._validate_role_operation_records(persisted)
 
     def test_unknown_operation_blocks_new_admission_after_state_reload(self):
         self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
@@ -4220,6 +4861,7 @@ class AgentWorkflowTest(unittest.TestCase):
             ISSUE,
             self.verified_role_operation_transition(retry, "dispatched"),
         )
+        self.write_role_operation_output(dispatched_retry)
         succeeded_retry = self.apply_role_operation_transition(
             ISSUE,
             self.verified_role_operation_transition(
@@ -4296,6 +4938,7 @@ class AgentWorkflowTest(unittest.TestCase):
         dispatched = self.apply_role_operation_transition(
             ISSUE, self.verified_role_operation_transition(admitted, "dispatched")
         )
+        self.write_role_operation_output(dispatched)
         success = self.verified_role_operation_transition(
             dispatched, "succeeded", result={"verified": True}
         )
@@ -4311,6 +4954,150 @@ class AgentWorkflowTest(unittest.TestCase):
         self.assertEqual("terminal-role-operation-immutable", raised.exception.code)
         self.assertEqual(accepted, replayed)
         self.assertEqual(accepted, self.state()["role_ops"][accepted["op_id"]])
+
+    def test_role_operation_success_uses_computed_evidence_not_executor_claims(self):
+        dispatched = self.dispatched_role_operation()
+        output = self.write_role_operation_output(
+            dispatched, b"authoritative operation output"
+        )
+        transition = self.verified_role_operation_transition(
+            dispatched,
+            "succeeded",
+            result={
+                "output_path": "ops/other-operation/plan",
+                "sha256": "0" * 64,
+                "byte_length": 0,
+                "accepted_artifact": {"path": "untrusted", "sha256": "f" * 64},
+                "accepted_delta": [{"change": "untrusted"}],
+            },
+        )
+
+        accepted = self.apply_role_operation_transition(ISSUE, transition)
+
+        self.assertEqual(
+            {"path", "sha256", "byte_length"},
+            set(accepted["result"]["accepted_artifact"]),
+        )
+        self.assertEqual(
+            dispatched["output_path"],
+            accepted["result"]["accepted_artifact"]["path"],
+        )
+        self.assertEqual(
+            hashlib.sha256(output.read_bytes()).hexdigest(),
+            accepted["result"]["accepted_artifact"]["sha256"],
+        )
+        self.assertEqual(output.stat().st_size, accepted["result"]["accepted_artifact"]["byte_length"])
+        self.assertEqual([], accepted["result"]["accepted_delta"])
+
+    def test_role_operation_success_rejects_output_found_only_for_another_operation(self):
+        dispatched = self.dispatched_role_operation()
+        run_root = workflow._run_root(
+            self.root, workflow._load_config(self.root), ISSUE
+        )
+        other_output = run_root / "ops" / ("f" * 32) / "plan"
+        other_output.parent.mkdir(parents=True)
+        other_output.write_bytes(b"wrong operation")
+        before = self.state()
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            self.apply_role_operation_transition(
+                ISSUE,
+                self.verified_role_operation_transition(
+                    dispatched,
+                    "succeeded",
+                    result={"output_path": str(other_output)},
+                ),
+            )
+
+        self.assertEqual(
+            "role-operation-evidence-missing",
+            raised.exception.code,
+        )
+        self.assertEqual(before, self.state())
+
+    def test_role_operation_evidence_rejects_wrong_path_and_role_binding(self):
+        dispatched = self.dispatched_role_operation()
+        self.write_role_operation_output(dispatched)
+        config = workflow._load_config(self.root)
+        wrong_path = json.loads(json.dumps(dispatched))
+        wrong_path["output_path"] = "ops/" + ("f" * 32) + "/plan"
+
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            workflow._verify_role_operation_evidence(
+                self.root, config, ISSUE, wrong_path
+            )
+        self.assertEqual("role-operation-output-path-invalid", raised.exception.code)
+
+        wrong_role = json.loads(json.dumps(dispatched))
+        wrong_role["role"] = "reviewer"
+        with self.assertRaises(workflow.WorkflowError) as raised:
+            workflow._verify_role_operation_evidence(
+                self.root, config, ISSUE, wrong_role
+            )
+        self.assertEqual("role-operation-role-mismatch", raised.exception.code)
+
+    def test_role_operation_evidence_rejects_symlink_escape(self):
+        dispatched = self.dispatched_role_operation()
+        run_root = workflow._run_root(
+            self.root, workflow._load_config(self.root), ISSUE
+        )
+        outside_temporary = tempfile.TemporaryDirectory(dir=self.root.parent)
+        outside = pathlib.Path(outside_temporary.name)
+        try:
+            (outside / "plan").write_bytes(b"outside output")
+            (run_root / "ops").mkdir()
+            (run_root / "ops" / dispatched["op_id"]).symlink_to(
+                outside, target_is_directory=True
+            )
+            before = self.state()
+
+            with self.assertRaises(workflow.WorkflowError) as raised:
+                self.apply_role_operation_transition(
+                    ISSUE,
+                    self.verified_role_operation_transition(
+                        dispatched, "succeeded", result={"verified": True}
+                    ),
+                )
+
+            self.assertEqual(
+                "role-operation-evidence-path-invalid",
+                raised.exception.code,
+            )
+            self.assertEqual(before, self.state())
+        finally:
+            outside_temporary.cleanup()
+
+    def test_role_operation_evidence_rejects_bytes_changed_between_reads(self):
+        dispatched = self.dispatched_role_operation()
+        output = self.write_role_operation_output(dispatched, b"first observation")
+        original_open = os.open
+        reads = {"count": 0}
+
+        def change_before_second_read(path, flags, *arguments, **keywords):
+            if (
+                isinstance(path, (str, os.PathLike))
+                and pathlib.Path(path).resolve() == output.resolve()
+            ):
+                reads["count"] += 1
+                if reads["count"] == 2:
+                    output.write_bytes(b"changed during verification")
+            return original_open(path, flags, *arguments, **keywords)
+
+        before = self.state()
+        with mock.patch.object(os, "open", side_effect=change_before_second_read):
+            with self.assertRaises(workflow.WorkflowError) as raised:
+                self.apply_role_operation_transition(
+                    ISSUE,
+                    self.verified_role_operation_transition(
+                        dispatched, "succeeded", result={"verified": True}
+                    ),
+                )
+
+        self.assertEqual(
+            "role-operation-evidence-unstable",
+            raised.exception.code,
+        )
+        self.assertEqual(before, self.state())
 
     def test_atomic_admission_survives_pre_and_post_replace_failures(self):
         self.assertEqual(0, self.run_cli("init", str(ISSUE))[0])
@@ -4479,6 +5266,7 @@ print(json.dumps(replayed, sort_keys=True))
             ISSUE,
             self.verified_role_operation_transition(reserved, "dispatched"),
         )
+        self.write_role_operation_output(dispatched)
         script = """
 import json
 import pathlib
@@ -4522,7 +5310,10 @@ print(json.dumps(accepted, sort_keys=True))
         self.assertEqual(0, completed.returncode, completed.stderr)
         accepted = json.loads(completed.stdout)
         self.assertEqual("succeeded", accepted["status"])
-        self.assertEqual({"verified": True}, accepted["result"])
+        self.assertEqual(
+            {"verified": True}, accepted["result"]["executor_result"]
+        )
+        self.assertEqual([], accepted["result"]["accepted_delta"])
         persisted = self.state()["role_ops"][dispatched["op_id"]]
         self.assertEqual(accepted, persisted)
         self.assertEqual(
